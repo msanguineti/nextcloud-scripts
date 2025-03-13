@@ -23,6 +23,8 @@ When you run this script, it will:
      - For MySQL/MariaDB, it uses a temporary credentials file to securely pass credentials to `mysqldump`.  
      - For PostgreSQL, it sets the `PGPASSWORD` environment variable before running `pg_dump`.
    - **Configuration Backup:** The Nextcloud configuration folder is copied to a backup location.
+  
+> **Note:** The script does not back up your data directory. It is recommended to back up your data separately.
 
 4. **Upgrade Execution:**  
    - The script puts Nextcloud into maintenance mode.
