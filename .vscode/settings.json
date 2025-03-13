@@ -1,0 +1,6 @@
+{
+  "shellformat.flag": "-s -ci",
+  "shellcheck.customArgs": [
+    "-x"
+  ]
+}
