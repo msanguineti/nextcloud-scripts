@@ -250,6 +250,7 @@ else
 fi
 
 # compress the database backup
+print_log info "Compressing database backup"
 gzip -f "$BACKUP_PATH/nextcloud-sqlbkp_${current_version}_${date}.bak"
 
 # backup nextcloud config folder
