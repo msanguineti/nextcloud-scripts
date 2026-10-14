@@ -257,7 +257,7 @@ gzip -f "$BACKUP_PATH/nextcloud-sqlbkp_${current_version}_${date}.bak"
 print_log info "Backing up Nextcloud config folder"
 cp -r "$NEXTCLOUD_PATH"/config "$BACKUP_PATH/nextcloud-dirbkp_${current_version}_${date}"
 
-temp_extract_dir=$(mktemp -d -t nextcloud_extract_XXXXXX)
+temp_extract_dir=$(mktemp -d -p /var/tmp nextcloud_extract_XXXXXX)
 print_log info "Extracting Nextcloud to '$temp_extract_dir'"
 if [ "$DOWNLOAD_FORMAT" = "zip" ]; then
     unzip -q "$archive_file" -d "$temp_extract_dir"
