@@ -22,7 +22,7 @@ import zipfile
 
 SCRIPT = Path(__file__).resolve().parents[1] / 'nextcloud-upgrade.sh'
 REAL_PHP = shutil.which(os.environ.get('TEST_PHP', 'php'))
-REAL_TOOLS = {name: shutil.which(name) for name in ('stat', 'mv', 'cp', 'tar', 'gzip', 'df', 'rsync')}
+REAL_TOOLS = {name: shutil.which(name) for name in ('stat', 'mv', 'cp', 'tar', 'gzip', 'df', 'rsync', 'sleep')}
 
 MOCK = r'''#!/usr/bin/env python3
 import json, os, pathlib, signal, sys, time
@@ -41,6 +41,7 @@ def fail_once(point):
         (root / ('failed-' + point)).touch()
         die(23)
 def cron_stopped():
+    if os.environ.get('BACKGROUND_MODE', 'cron') != 'cron': return True
     path = root / 'cron'
     return not path.exists() or all(line.lstrip().startswith('#') or 'cron.php' not in line for line in path.read_text().splitlines())
 if name == 'sudo':
@@ -64,6 +65,11 @@ if name == 'sudo':
                   'dbhost': os.environ.get('DB_HOST', 'localhost'), 'updater.release.channel': 'stable'}
         if a[1] not in values: die(1)
         print(values[a[1]])
+    elif a[0] == 'config:app:get':
+        assert a[1:] == ['core', 'backgroundjobs_mode', '--default-value=ajax'], a
+        if mode == 'background-mode-read': die(26)
+        value = os.environ.get('BACKGROUND_MODE', 'cron')
+        print('ajax' if value == 'unset' else value)
     elif a[0] == 'config:list':
         extra_paths = json.loads(os.environ.get('EXTRA_APPS_PATHS', '["custom_apps"]'))
         system = {'apps_paths': [{'path': str(root / 'nextcloud/apps')}, *[{'path': str(root / 'nextcloud' / p)} for p in extra_paths]]}
@@ -172,6 +178,7 @@ elif name == 'systemctl':
 elif name == 'crontab':
     assert args[:2] == ['-u', os.environ.get('WEB_USER', 'www-data')]
     if args[2] == '-l':
+        event('cron read')
         if mode == 'cron-unreadable': die(1)
         if not (root / 'cron').exists(): print('no crontab for ' + args[1], file=sys.stderr); die(1)
         sys.stdout.write((root / 'cron').read_text())
@@ -286,6 +293,15 @@ elif name == 'rsync':
         fail_once('data-copy')
         if mode == 'signal-data-copy': os.kill(int(os.environ['UPGRADE_PID']), signal.SIGTERM); time.sleep(.2); die(143)
     os.execv(os.environ['REAL_RSYNC'], [os.environ['REAL_RSYNC'], *args])
+elif name == 'sleep':
+    event('sleep ' + ' '.join(args))
+    if args == [os.environ['WAIT_AFTER_MAINTENANCE']]:
+        assert load('status')['maintenance']
+        assert cron_stopped()
+        assert all(state == 'active' for state in load('services').values())
+        if mode == 'signal-settling':
+            os.kill(int(os.environ['UPGRADE_PID']), signal.SIGINT); time.sleep(.2); die(130)
+    os.execv(os.environ['REAL_SLEEP'], [os.environ['REAL_SLEEP'], *args])
 elif name == 'ssh':
     assert args[:3] == ['-T', '-o', 'BatchMode=yes'], args
     assert 'StrictHostKeyChecking=yes' in args
@@ -367,7 +383,7 @@ class UpgradeFixture:
                         SERVICE_MANAGER=self.service_manager,
                         WEB_USER='www-data', WEB_GROUP='', PHP_BIN='php',
                         NEXTCLOUD_PATH=str(r / 'nextcloud'), BACKUP_PATH=str(r / 'backups'),
-                        WAIT_BEFORE_BACKUP='0', WAIT_AFTER_SERVER_START='0')
+                        WAIT_AFTER_MAINTENANCE='0', WAIT_BEFORE_BACKUP='0', WAIT_AFTER_SERVER_START='0')
         for name, tool in REAL_TOOLS.items():
             if tool: self.env['REAL_' + name.upper()] = tool
 
@@ -677,6 +693,68 @@ class UpgradeScenarios(UpgradeFixture):
                 self.assertEqual(p.returncode, 0, self.output)
                 self.assert_original()
 
+    def http_jobs_fixture(self, mode, no_crontab=True):
+        f = type(self)('test_success_preserves_config_apps_themes_schedule_and_recovery')
+        f.setUp()
+        self.addCleanup(f.doCleanups)
+        f.env['BACKGROUND_MODE'] = mode
+        f.original_cron = '17 3 * * * echo unrelated\n'
+        (f.root / 'cron').write_text(f.original_cron)
+        if no_crontab:
+            (f.root / 'bin/crontab').unlink()
+        return f
+
+    def test_http_background_modes_do_not_require_or_read_crontab(self):
+        for mode, no_crontab in (('ajax', True), ('webcron', True), ('unset', True), ('none', True), ('ajax', False), ('webcron', False)):
+            with self.subTest(mode=mode, no_crontab=no_crontab):
+                f = self.http_jobs_fixture(mode, no_crontab)
+                archive = 'yes' if mode == 'webcron' and no_crontab else 'no'
+                self.assertEqual(f.run_upgrade('cron-unreadable', extra={'BACKUP_ARCHIVE': archive}).returncode, 0, f.output)
+                self.assertFalse(json.loads((f.root / 'status').read_text())['maintenance'])
+                self.assertTrue(all(state == 'active' for state in json.loads((f.root / 'services').read_text()).values()))
+                self.assertEqual((f.root / 'cron').read_text(), f.original_cron)
+                events = (f.root / 'events').read_text().splitlines()
+                self.assertFalse(any(event.startswith('cron ') for event in events))
+                recovery = next((f.root / 'backups').glob('upgrade-*/manifest')).parent
+                manifest = (recovery / 'manifest').read_text()
+                self.assertIn('background_jobs_mode=' + ('ajax' if mode == 'unset' else mode), manifest)
+                self.assertIn('account_crontab_managed=no', manifest)
+                self.assertFalse((recovery / 'cron.original').exists())
+                if archive == 'yes':
+                    with tarfile.open(recovery / 'backup.tar') as saved:
+                        self.assertIn('database.sql.gz', saved.getnames())
+                        self.assertNotIn('cron.original', saved.getnames())
+                        self.assertNotIn('cron.disabled', saved.getnames())
+
+    def test_http_background_recovery_never_touches_crontab(self):
+        for mode in ('ajax', 'webcron'):
+            for failure in ('backup', 'migration'):
+                with self.subTest(mode=mode, failure=failure):
+                    f = self.http_jobs_fixture(mode)
+                    self.assertNotEqual(f.run_upgrade(failure).returncode, 0, f.output)
+                    self.assertEqual((f.root / 'cron').read_text(), f.original_cron)
+                    self.assertFalse(any(event.startswith('cron ') for event in (f.root / 'events').read_text().splitlines()))
+                    self.assertNotIn('crontab: command not found', f.output)
+                    if failure == 'backup':
+                        f.assert_original()
+                    else:
+                        self.assertTrue(json.loads((f.root / 'status').read_text())['maintenance'])
+                        self.assertTrue(all(state == 'inactive' for state in json.loads((f.root / 'services').read_text()).values()))
+                        self.assertTrue((f.root / 'backups/upgrade-active').exists())
+
+    def test_background_mode_errors_leave_production_unchanged(self):
+        for mode, failure in (('unknown', ''), ('', ''), ('cron', 'background-mode-read')):
+            with self.subTest(mode=mode, failure=failure):
+                self.assertNotEqual(self.run_upgrade(failure, extra={'BACKGROUND_MODE': mode}).returncode, 0, self.output)
+                self.assertNotIn('occ maintenance:mode', (self.root / 'events').read_text())
+                self.assert_original()
+
+    def test_cron_with_an_external_scheduler_needs_no_crontab_binary(self):
+        f = self.http_jobs_fixture('cron')
+        self.assertEqual(f.run_upgrade().returncode, 0, f.output)
+        self.assertIn('crontab is unavailable', f.output)
+        self.assertFalse(any(event.startswith('cron ') for event in (f.root / 'events').read_text().splitlines()))
+
     def test_postgresql_success(self):
         self.assertEqual(self.run_upgrade(extra={'DB_TYPE': 'pgsql'}).returncode, 0, self.output)
 
@@ -822,6 +900,14 @@ class UpgradeScenarios(UpgradeFixture):
         self.assertIn('already running', self.output)
         self.assert_original()
 
+    def test_invalid_maintenance_grace_is_rejected_before_changes(self):
+        for value in ('-1', '1.5', 'invalid', '100000'):
+            with self.subTest(value=value):
+                self.assertNotEqual(self.run_upgrade(extra={'WAIT_AFTER_MAINTENANCE': value}).returncode, 0, self.output)
+                self.assertIn('Wait values must be nonnegative integers', self.output)
+                self.assertEqual((self.root / 'events').read_text(), '')
+                self.assert_original()
+
     def test_invalid_service_manager_is_rejected_before_changes(self):
         self.assertNotEqual(self.run_upgrade(extra={'SERVICE_MANAGER': 'unsupported'}).returncode, 0, self.output)
         self.assertIn('SERVICE_MANAGER must be monit or systemd', self.output)
@@ -851,6 +937,7 @@ class ServiceScenarios(UpgradeFixture):
         self.assertTrue((r / 'nextcloud/themes/custom/style.css').exists())
         self.assertEqual((r / 'nextcloud/.user.ini').read_text(), 'custom ini')
         recovery = next((r / 'backups').glob('upgrade-*'))
+        self.assertRegex(recovery.name, r'^upgrade-34\.0\.0\.0-[0-9]{8}T[0-9]{6}Z\.[A-Za-z0-9]{8}$')
         self.assertTrue((recovery / 'database.sql.gz').exists())
         self.assertEqual((recovery / 'phase').read_text(), 'complete\n')
         self.assertNotIn('secret', self.output)
@@ -889,6 +976,23 @@ class ServiceScenarios(UpgradeFixture):
         self.assertEqual(json.loads((self.root / 'services').read_text()), {'nginx': 'inactive', 'php8.4-fpm': 'active'})
         self.assertEqual((self.root / 'cron').read_text(), self.original_cron)
         self.assertFalse((self.root / 'backups/upgrade-active').exists())
+
+    def settling_sleep(self):
+        (self.root / 'bin/sleep').unlink()
+        (self.root / 'bin/sleep').symlink_to(self.root / 'bin/mock')
+        return {'WAIT_AFTER_MAINTENANCE': '1'}
+
+    def test_maintenance_grace_precedes_service_shutdown_and_backups(self):
+        self.assertEqual(self.run_upgrade(extra=self.settling_sleep()).returncode, 0, self.output)
+        events = (self.root / 'events').read_text().splitlines()
+        self.assertLess(events.index('occ maintenance:mode'), events.index('sleep 1'))
+        self.assertLess(events.index('sleep 1'), events.index(self.service_command + ' stop nginx'))
+        self.assertLess(events.index(self.service_command + ' stop php8.4-fpm'), events.index('dump'))
+
+    def test_interrupt_during_maintenance_grace_restores_original(self):
+        self.assertNotEqual(self.run_upgrade('signal-settling', extra=self.settling_sleep()).returncode, 0, self.output)
+        self.assert_original()
+        self.assertNotIn('dump', (self.root / 'events').read_text().splitlines())
 
     def test_service_state_polling_waits_for_completion(self):
         self.assertEqual(self.run_upgrade(extra={'SERVICE_DELAY': 'yes', 'WAIT_AFTER_SERVER_START': '1'}).returncode, 0, self.output)
