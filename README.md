@@ -318,11 +318,34 @@ TEST_PHP=/usr/bin/php8.4 python3 -B -m unittest discover -s tests -k test_zip_su
 ```
 
 Tests use temporary files and simulated services, databases and GitHub requests;
-no root access, Docker or live Nextcloud server is needed. CI runs the same checks on PRs and `main` pushes.
+no root access, Docker or live Nextcloud server is needed. CI runs the same
+checks on PRs and `main` pushes.
 
 The upgrade flow is in `nextcloud-upgrade.sh`. `set_phase` records progress and
 `on_exit` handles recovery; automatic rollback ends when database migration
 starts. Data handling is separate from application ownership changes.
+
+### Container setup
+
+To keep development dependencies off your system, use Docker instead of the
+native setup above. From your repository checkout, build once:
+
+```bash
+docker build -t nextcloud-script-dev .devcontainer
+```
+
+Run all checks:
+
+```bash
+docker run --rm --user "$(id -u):$(id -g)" \
+  --mount "type=bind,source=$PWD,target=/workspace,readonly" \
+  nextcloud-script-dev
+```
+
+Docker must be available on your machine. PHP and the other tools stay inside
+the container; your source is mounted read-only and temporary test files are
+removed when it exits. Rebuild the image after changing its Dockerfile. Add
+`-e TEST_JOBS=1` before the image name to run tests sequentially.
 
 ### Releases
 
