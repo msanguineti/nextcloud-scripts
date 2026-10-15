@@ -89,6 +89,7 @@ cron_was_present=yes
 finished=no
 upgrade_started=$SECONDS
 offline_started=''
+progress_pid=''
 
 log() {
     local symbol='[i]' color=36
@@ -105,6 +106,41 @@ log() {
         printf '%s [%s] %s\n' "$symbol" "$phase" "$*"
     fi
 }
+# Status goes to stderr so command output can still be saved or piped safely.
+stop_progress() {
+    if [[ -n $progress_pid ]]; then
+        kill "$progress_pid" 2>/dev/null || true
+        wait "$progress_pid" 2>/dev/null || true
+        progress_pid=''
+    fi
+}
+start_progress() {
+    stop_progress
+    local message=$1 started=$SECONDS
+    log "$message" >&2
+    (
+        # This display process must never inherit the upgrade's recovery traps.
+        trap - EXIT ERR INT TERM HUP
+        set +e
+        timer=''
+        trap 'for timer in $(jobs -pr); do kill "$timer" 2>/dev/null; done; wait; exit 0' INT TERM HUP
+        while :; do
+            sleep 15 &
+            wait "$!" || exit 0
+            log "$message ($((SECONDS - started))s elapsed; still running)." >&2
+        done
+    ) &
+    progress_pid=$!
+}
+with_progress() {
+    local message=$1
+    shift
+    start_progress "$message"
+    # Keep the actual operation in the foreground, with the normal error traps.
+    "$@"
+    stop_progress
+}
+
 fail() { log --error "ERROR: $*" >&2; exit 1; }
 need() { command -v "$1" >/dev/null || fail "Required command missing: $1"; }
 occ() { (cd "$NEXTCLOUD_PATH" && sudo -u "$WEB_USER" "$PHP_BIN" ./occ "$@"); }
@@ -401,6 +437,7 @@ on_exit() {
     local rc=$? safe=yes
     trap - EXIT ERR INT TERM HUP
     set +e
+    stop_progress
     [[ -z $credentials ]] || rm -f -- "$credentials"
     if [[ $rc != 0 ]]; then
         log --error "FAILED (exit $rc). No successful upgrade is being reported." >&2
@@ -585,8 +622,8 @@ check_space() {
 # Archive links must name a regular file in the same directory. This permits
 # shipped asset/license links without allowing a link to redirect extraction.
 if [[ $DOWNLOAD_FORMAT == tar.bz2 ]]; then
-    tar -tjf "$workspace/$archive_name" > "$workspace/archive.names"
-    tar -tvjf "$workspace/$archive_name" > "$workspace/archive.details"
+    with_progress 'Reading release archive paths' tar -tjf "$workspace/$archive_name" > "$workspace/archive.names"
+    with_progress 'Reading release archive file types and links' tar -tvjf "$workspace/$archive_name" > "$workspace/archive.details"
     awk '
         {t=substr($1,1,1); types[$6]=t}
         t!="-" && t!="d" && t!="l" {bad=1}
@@ -605,8 +642,8 @@ if [[ $DOWNLOAD_FORMAT == tar.bz2 ]]; then
     ' "$workspace/archive.details" || fail 'Archive contains unsafe links or special files.'
     read -r unpacked_bytes entry_count < <(awk '{bytes+=$3;n++} END {printf "%.0f %d\n",bytes,n}' "$workspace/archive.details")
 else
-    unzip -Z1 "$workspace/$archive_name" > "$workspace/archive.names"
-    zipinfo -l "$workspace/$archive_name" > "$workspace/archive.details"
+    with_progress 'Reading release archive paths' unzip -Z1 "$workspace/$archive_name" > "$workspace/archive.names"
+    with_progress 'Reading release archive file types and links' zipinfo -l "$workspace/$archive_name" > "$workspace/archive.details"
     awk '/^[bcps]/ {exit 1} /^l/ {print $NF}' "$workspace/archive.details" > "$workspace/archive.links" || fail 'ZIP contains special files.'
     : > "$workspace/archive.link-targets"
     while IFS= read -r link; do
@@ -633,23 +670,24 @@ awk '$0 !~ /^nextcloud(\/|$)/ || $0 ~ /(^|\/)\.\.(\/|$)/ || $0 ~ /\\/ {exit 1}' 
 (( unpacked_bytes > 0 && entry_count > 0 )) || fail 'Empty release archive.'
 check_space "$workspace" "$((unpacked_bytes + 104857600))" "$((entry_count + 1000))"
 if [[ $DOWNLOAD_FORMAT == tar.bz2 ]]; then
-    tar --no-same-owner -xjf "$workspace/$archive_name" -C "$workspace"
+    with_progress 'Extracting the checked release' tar --no-same-owner -xjf "$workspace/$archive_name" -C "$workspace"
 else
-    unzip -q "$workspace/$archive_name" -d "$workspace"
+    with_progress 'Extracting the checked release' unzip -q "$workspace/$archive_name" -d "$workspace"
 fi
 release="$workspace/nextcloud"
 for file in occ version.php index.php status.php lib/versioncheck.php; do [[ -f $release/$file ]] || fail "Release missing $file"; done
 find "$release" -type l -print0 > "$workspace/release.links"
-check_file_links "$release" "$workspace/release.links"
+with_progress 'Checking extracted file links' check_file_links "$release" "$workspace/release.links"
 php_info release "$release" "$download_version"
 log --success 'Stable release and PHP compatibility checked.'
 # Stage on the installation filesystem so both replacements are renames, not copies.
 parent=$(dirname -- "$NEXTCLOUD_PATH")
+log 'Checking staging space and existing application size.'
 app_bytes=$(find_application -printf '%s\n' | awk '{bytes+=$1} END {printf "%.0f\n",bytes}')
 app_inodes=$(find_application -printf '.\n' | wc -l)
 check_space "$parent" "$((unpacked_bytes + app_bytes + 104857600))" "$((entry_count + app_inodes + 1000))"
 stage=$(mktemp -d -p "$parent" .nextcloud-stage.XXXXXXXX)
-cp -a -- "$release" "$stage/nextcloud"
+with_progress 'Copying the release into staging' cp -a -- "$release" "$stage/nextcloud"
 if [[ -n $data_relative ]]; then
     # Some archives contain the standard data/ skeleton. It is not live data.
     if [[ $data_relative == data && -d $stage/nextcloud/data ]]; then

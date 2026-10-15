@@ -92,6 +92,8 @@ sudo nextcloud-upgrade
 The script prepares the release, displays the selected versions and settings,
 then asks for confirmation. Enter `y` to proceed. Services and maintenance mode
 are changed only after confirmation.
+Archive inspection, extraction and staging show the current step and an
+elapsed-time update every 15 seconds while running.
 
 To select a maintenance release within the installed major version:
 
