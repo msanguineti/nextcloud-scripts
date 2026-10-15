@@ -117,6 +117,14 @@ elif name == 'monit' or (name == 'systemctl' and args[0] in ('start', 'stop')):
     assert svc in load('services'), svc
     if action == 'stop': fail_once('stop-' + svc)
     if action == 'start': fail_once('start-' + svc)
+    if action == 'stop' and svc == 'nginx' and not (root / 'custom-source-changed').exists():
+        (root / 'custom-source-changed').touch()
+        custom = root / 'nextcloud/local.txt'
+        if mode == 'custom-disappeared': custom.unlink()
+        if mode == 'custom-symlink':
+            custom.unlink(); custom.symlink_to(root / 'storage/sentinel')
+        if mode == 'custom-mount': (root / 'mounted').touch()
+        if mode == 'custom-app-conflict': (root / 'nextcloud/custom_apps/core').mkdir()
     state = load('services')
     expected = 'active' if action == 'start' else 'inactive'
     state[svc] = expected
@@ -180,6 +188,7 @@ elif name in ('mariadb-dump', 'mysqldump', 'pg_dump'):
 elif name == 'findmnt':
     print('/')
     if mode == 'mount': print(str(root / 'nextcloud/data'))
+    if (root / 'mounted').exists(): print(str(root / 'nextcloud/local.txt'))
 elif name == 'pgrep':
     if mode == 'background': print('1234'); die(0)
     die(1)
@@ -202,6 +211,7 @@ elif name == 'mv':
     os.execv(os.environ['REAL_MV'], [os.environ['REAL_MV'], *args])
 elif name == 'cp':
     if args[-2].endswith('/config') and '/backups/' in args[-1]: fail_once('config-backup')
+    if args[-2] == str(root / 'nextcloud/local.txt') and '.nextcloud-stage.' in args[-1]: fail_once('custom-copy')
     os.execv(os.environ['REAL_CP'], [os.environ['REAL_CP'], *args])
 elif name == 'tar':
     if '-xjf' in args: fail_once('extract')
@@ -353,6 +363,129 @@ class UpgradeScenarios:
 
     def test_zip_success(self):
         self.assertEqual(self.run_upgrade(extra={'DOWNLOAD_FORMAT': 'zip'}).returncode, 0, self.output)
+
+    def preservation_list(self, text):
+        path = self.root / 'preserve.txt'
+        path.write_text(text)
+        return {'PRESERVE_PATHS_FILE': str(path)}
+
+    def assert_preservation_refused(self, extra, message):
+        self.assertNotEqual(self.run_upgrade(extra=extra).returncode, 0, self.output)
+        self.assertIn(message, self.output)
+        self.assert_original()
+        self.assertNotIn('occ maintenance:mode', (self.root / 'events').read_text())
+
+    def test_extra_files_directories_and_literal_names_are_preserved(self):
+        r = self.root
+        custom = r / 'nextcloud/local assets'
+        custom.mkdir(); (custom / '.hidden').write_text('hidden content')
+        (custom / 'nested').mkdir(); (custom / 'nested/theme.css').write_text('css')
+        (r / 'nextcloud/lib/local.txt').parent.mkdir(exist_ok=True)
+        (r / 'nextcloud/lib/local.txt').write_text('nested file')
+        literal = 'notes $(touch owned).txt'
+        (r / 'nextcloud' / literal).write_text('literal name')
+        extra = self.preservation_list('# Additional files\n\nlocal assets\nlib/local.txt\n' + literal)
+        self.assertEqual(self.run_upgrade(extra=extra).returncode, 0, self.output)
+        self.assertEqual((r / 'nextcloud/local assets/.hidden').read_text(), 'hidden content')
+        self.assertEqual((r / 'nextcloud/local assets/nested/theme.css').read_text(), 'css')
+        self.assertEqual((r / 'nextcloud/lib/local.txt').read_text(), 'nested file')
+        self.assertEqual((r / 'nextcloud' / literal).read_text(), 'literal name')
+        self.assertFalse((r / 'owned').exists())
+        recovery = next((r / 'backups').glob('upgrade-*'))
+        self.assertEqual((recovery / 'preserved-paths').read_text().splitlines(),
+                         ['custom_apps', 'apps/extra', 'themes/custom', 'local assets', 'lib/local.txt', literal])
+        self.assertEqual((r / 'storage/sentinel').read_text(), 'Never modify or duplicate EFS data')
+        self.assertFalse(any((r / 'nextcloud').rglob('sentinel')))
+
+    def test_unselected_custom_file_stays_only_in_retained_old_application(self):
+        (self.root / 'nextcloud/local.txt').write_text('local content')
+        self.assertEqual(self.run_upgrade(extra=self.preservation_list('# No extra paths\n\n')).returncode, 0, self.output)
+        self.assertFalse((self.root / 'nextcloud/local.txt').exists())
+        old = next(self.root.glob('nextcloud.old.*'))
+        self.assertEqual((old / 'local.txt').read_text(), 'local content')
+
+    def test_invalid_and_reserved_preservation_paths_fail_before_maintenance(self):
+        for path, message in [('../storage', 'canonical installation-relative'),
+                              ('/etc/passwd', 'Invalid preservation path'),
+                              ('.', 'canonical installation-relative'),
+                              ('local/../occ', 'canonical installation-relative'),
+                              ('./occ', 'canonical installation-relative'),
+                              ('lib//local.txt', 'canonical installation-relative'),
+                              ('custom_apps/', 'Invalid preservation path'),
+                              ('local\r', 'Invalid preservation path'),
+                              ('missing', 'Missing preservation'),
+                              ('data', 'reserved'), ('data/files', 'reserved'),
+                              ('config', 'reserved'), ('config/config.php', 'reserved'),
+                              ('.htaccess', 'reserved'), ('.user.ini', 'reserved')]:
+            with self.subTest(path=path):
+                self.assert_preservation_refused(self.preservation_list(path + '\n'), message)
+
+    def test_missing_or_nonfile_preservation_list_is_rejected(self):
+        for path in (self.root / 'missing.txt', self.root / 'storage'):
+            with self.subTest(path=path):
+                self.assert_preservation_refused({'PRESERVE_PATHS_FILE': str(path)}, 'readable regular file')
+
+    def test_preservation_refuses_release_files_directories_and_file_parents(self):
+        r = self.root
+        (r / 'nextcloud/apps/core/custom.txt').write_text('old shipped app')
+        (r / 'nextcloud/assets').mkdir(); (r / 'nextcloud/assets/local.txt').write_text('custom')
+        (r / 'release/nextcloud/assets').write_text('new shipped file'); self.make_archive()
+        for path, message in [('occ', 'overwrite a release'), ('apps/core', 'overwrite a release'),
+                              ('assets/local.txt', 'file as its destination parent')]:
+            with self.subTest(path=path):
+                self.assert_preservation_refused(self.preservation_list(path), message)
+
+    def test_duplicate_and_overlapping_preservation_paths_are_rejected(self):
+        (self.root / 'nextcloud/local').mkdir()
+        (self.root / 'nextcloud/local/note').write_text('note')
+        for paths in ('local\nlocal', 'local\nlocal/note', 'local/note\nlocal',
+                      'custom_apps/test', 'themes/custom/style.css', 'apps/extra'):
+            with self.subTest(paths=paths):
+                self.assert_preservation_refused(self.preservation_list(paths), 'Overlapping preservation paths')
+
+    def test_automatic_custom_directories_cannot_overwrite_release_content(self):
+        for path in ('custom_apps', 'themes/custom'):
+            with self.subTest(path=path):
+                destination = self.root / 'release/nextcloud' / path
+                destination.mkdir(parents=True)
+                (destination / 'shipped').write_text('release content'); self.make_archive()
+                self.assert_preservation_refused({}, 'overwrite a release file or directory: ' + path)
+                shutil.rmtree(destination)
+
+    def test_custom_app_cannot_shadow_newly_shipped_app_from_another_directory(self):
+        app = self.root / 'nextcloud/custom_apps/core'
+        app.mkdir(); (app / 'custom.php').write_text('old custom implementation')
+        self.assert_preservation_refused({}, 'Custom app conflicts with an app shipped by the release: custom_apps/core (apps/core)')
+
+    def test_custom_symlinks_and_special_files_are_refused(self):
+        local = self.root / 'nextcloud/local.txt'
+        local.symlink_to(self.root / 'storage/sentinel')
+        extra = self.preservation_list('local.txt')
+        self.assert_preservation_refused(extra, 'Only regular files and directories')
+        local.unlink(); os.mkfifo(local)
+        self.assert_preservation_refused(extra, 'Only regular files and directories')
+
+    def test_changed_custom_sources_and_copy_failure_recover_original_installation(self):
+        for mode, message in [('custom-disappeared', 'Missing preservation'),
+                              ('custom-symlink', 'Only regular files and directories'),
+                              ('custom-mount', 'Mount inside application tree'),
+                              ('custom-app-conflict', 'Custom app conflicts'),
+                              ('custom-copy', 'failed at script line')]:
+            with self.subTest(mode=mode):
+                fixture = type(self)('test_success_preserves_config_apps_themes_schedule_and_recovery')
+                fixture.setUp()
+                try:
+                    (fixture.root / 'nextcloud/local.txt').write_text('custom')
+                    self.assertNotEqual(fixture.run_upgrade(mode, extra=fixture.preservation_list('local.txt')).returncode, 0, fixture.output)
+                    self.assertIn(message, fixture.output)
+                    fixture.assert_original()
+                    self.assertNotIn('occ upgrade', (fixture.root / 'events').read_text())
+                    recovery = next((fixture.root / 'backups').glob('upgrade-*'))
+                    self.assertIn('local.txt', (recovery / 'preserved-paths').read_text())
+                    if mode == 'custom-copy':
+                        self.assertTrue((recovery / 'database.sql.gz').exists())
+                        self.assertEqual((fixture.root / 'nextcloud/local.txt').read_text(), 'custom')
+                finally: fixture.doCleanups()
 
     def test_explicit_same_major_target(self):
         self.assertEqual(self.run_upgrade(args=('34.0.1',)).returncode, 0, self.output)

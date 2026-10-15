@@ -127,6 +127,7 @@ sudo env NEXTCLOUD_PATH=/srv/nextcloud \
 | `SERVICE_MANAGER` | `monit` | Service control backend: `monit` or `systemd`. |
 | `WEB_SERVICE` | `nginx` | Web-server systemd unit name; also the Monit name when selected. |
 | `PHP_SERVICE` | `php8.4-fpm` | Separate PHP-FPM service name, or `none` for PHP embedded in the web server. |
+| `PRESERVE_PATHS_FILE` | Unset | Optional text file listing extra installation-relative files or directories to transfer. See below. |
 | `WAIT_BEFORE_BACKUP` | `60` | Maximum seconds to wait for existing Nextcloud cron/occ processes after services stop. |
 | `WAIT_AFTER_SERVER_START` | `20` | Maximum seconds to poll each service state after its start/stop command returns. |
 | `DOWNLOAD_FORMAT` | `tar.bz2` | Release archive format: `tar.bz2` or `zip`. |
@@ -207,8 +208,63 @@ custom themes, and additional direct-child app directories configured in
 new release, unless their metadata marks them as shipped apps. When an app is
 included in the new release, the new release's copy takes precedence.
 
-Check custom app and theme compatibility before upgrading. Other custom files
-are retained in the old installation but are not automatically transferred.
+Nextcloud's [upgrade guidance](https://docs.nextcloud.com/server/stable/admin_manual/maintenance/upgrade.html#prerequisites)
+says to check third-party app compatibility and disable those apps before the
+upgrade; re-enable compatible apps afterward. Its
+[manual upgrade guide](https://docs.nextcloud.com/server/stable/admin_manual/maintenance/manual_upgrade.html)
+instructs administrators to transfer custom apps and themes, noting that themes
+may need modifications after upgrading. Copying files does not establish
+compatibility: use a supported app version and review or adapt custom themes.
+
+Nextcloud also [warns against custom app directory conflicts](https://docs.nextcloud.com/server/stable/admin_manual/apps_management.html#using-custom-app-directories).
+This script stops before maintenance if an additional app directory or custom
+theme would collide with release content, or an app in an additional app
+directory has the same directory name as an app shipped by the new release.
+Stopping on these conflicts is this script's policy; the cited guides do not
+provide an automatic merge procedure. Review the conflicting component and its
+configuration before retrying. The script does not rename apps or themes or
+rewrite `apps_paths` to resolve conflicts.
+
+Other custom files are retained in the old installation but are not automatically
+transferred.
+
+To transfer extra files or directories, create a plain text list, for example
+`/root/nextcloud-preserve.txt`:
+
+```text
+# Paths relative to NEXTCLOUD_PATH
+local-assets
+lib/local-settings.json
+my custom page.html
+```
+
+Then run:
+
+```bash
+sudo env PRESERVE_PATHS_FILE=/root/nextcloud-preserve.txt nextcloud-upgrade
+```
+
+Each entry names an existing regular file or directory inside the installation.
+Directories include their contents, including hidden files. Use one literal path
+per line, without quotes or a trailing slash. Spaces are supported; wildcards,
+shell variables and commands are not expanded. Empty lines and lines beginning
+with `#` are ignored. A list containing only comments or empty lines keeps the
+default preservation behavior.
+
+The script prints the selected paths before asking to proceed. It refuses missing
+paths, absolute paths, `.` or `..` components, duplicates and overlapping entries.
+Do not list paths already transferred automatically, such as `custom_apps/`
+or a custom theme. Configuration, `.htaccess` and `.user.ini` are handled
+separately. The `data/` path is reserved: this option does not back up user data
+or copy files from outside the installation.
+
+Extra files and directories must not overwrite anything supplied by the new
+release. The same protection applies to automatically transferred custom themes
+and additional app directories. A conflict stops the upgrade before maintenance
+mode so you can review it; this option cannot carry local modifications to
+shipped code into the new version. The script checks the source tree again after
+stopping services and refuses symlinks, mounts and special files.
+
 Ownership and permissions are applied only to the staged application:
 `www-data:www-data`, directories `750`, and files `640`.
 
@@ -218,6 +274,7 @@ Each confirmed attempt creates a unique directory under `BACKUP_PATH`, named
 `upgrade-TIMESTAMP.RANDOM`. After a successful backup it contains
 `database.sql.gz` and the complete `config/` directory. It also records original
 cron entries, recovery paths, progress and, once migration starts, `upgrade.log`.
+The `preserved-paths` file records the custom paths selected for transfer.
 Files ending in `.part` are incomplete backups.
 
 The previous application is retained alongside the installation in a unique
@@ -267,6 +324,9 @@ and validates releases/status. `stop_services`, `start_services` and
 `wait_service` handle service control through `service_control`; `check_services`
 validates the selected backend's prerequisites. `restore_cron` checks for
 concurrent edits.
+`add_preserved_path` builds the transfer list and rejects collisions;
+`check_preserved_path` validates entries before copying. `check_application_tree`
+rejects unsupported source files and mounts before preparation and after shutdown.
 Keep ownership/deletion operations away from the user-data directory.
 
 Run local checks from the repository:

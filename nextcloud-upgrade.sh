@@ -17,6 +17,9 @@ WAIT_BEFORE_BACKUP="${WAIT_BEFORE_BACKUP:-60}"
 WAIT_AFTER_SERVER_START="${WAIT_AFTER_SERVER_START:-20}"
 DOWNLOAD_FORMAT="${DOWNLOAD_FORMAT:-tar.bz2}"
 CHECKSUM_TYPE="${CHECKSUM_TYPE:-sha256}"
+# Plain text, one installation-relative path per line; never sourced as shell code.
+PRESERVE_PATHS_FILE="${PRESERVE_PATHS_FILE:-}"
+preserved_paths=()
 
 phase=preflight
 workspace='' stage='' recovery='' old_path='' credentials=''
@@ -31,6 +34,53 @@ fail() { log "ERROR: $*" >&2; exit 1; }
 need() { command -v "$1" >/dev/null || fail "Required command missing: $1"; }
 occ() { (cd "$NEXTCLOUD_PATH" && sudo -u www-data php ./occ "$@"); }
 config() { occ config:system:get "$1"; }
+
+check_application_tree() {
+    local mounts mount unsupported
+    mounts=$(findmnt --raw --noheadings --output TARGET)
+    while IFS= read -r mount; do
+        [[ $mount != "$NEXTCLOUD_PATH" && $mount != "$NEXTCLOUD_PATH/"* ]] || fail "Mount inside application tree: $mount"
+    done <<< "$mounts"
+    unsupported=$(find "$NEXTCLOUD_PATH" ! -type d ! -type f -print -quit)
+    [[ -z $unsupported ]] || fail "Only regular files and directories are supported in the application tree (no symlinks): $unsupported"
+}
+
+check_preserved_path() {
+    local path=$1 ancestor=$1
+    [[ -n $path && $path != /* && $path != */ && $path != *[[:cntrl:]]* ]] || fail "Invalid preservation path: $path"
+    case /$path/ in *'/../'*|*'/./'*|*'//'*) fail "Use a canonical installation-relative preservation path: $path";; esac
+    case $path in
+        config|config/*|data|data/*|.htaccess|.htaccess/*|.user.ini|.user.ini/*)
+            fail "Preservation path is reserved or already handled automatically: $path" ;;
+    esac
+    [[ -f $NEXTCLOUD_PATH/$path || -d $NEXTCLOUD_PATH/$path ]] || fail "Missing preservation file or directory: $path"
+    [[ $(realpath -e -- "$NEXTCLOUD_PATH/$path") == "$NEXTCLOUD_PATH/$path" ]] || fail "Preservation path must not traverse symlinks: $path"
+    [[ ! -e $stage/nextcloud/$path && ! -L $stage/nextcloud/$path ]] || fail "Preservation path would overwrite a release file or directory: $path"
+    while [[ $ancestor == */* ]]; do
+        ancestor=${ancestor%/*}
+        [[ ! -e $stage/nextcloud/$ancestor || -d $stage/nextcloud/$ancestor ]] || fail "Preservation path has a file as its destination parent: $path"
+    done
+}
+
+add_preserved_path() {
+    local path=$1 existing
+    check_preserved_path "$path"
+    for existing in "${preserved_paths[@]}"; do
+        [[ $path != "$existing" && $path != "$existing/"* && $existing != "$path/"* ]] || fail "Overlapping preservation paths: $path and $existing"
+    done
+    preserved_paths+=("$path")
+}
+
+check_custom_apps() {
+    local apps_dir app
+    while IFS= read -r apps_dir; do
+        [[ -d $NEXTCLOUD_PATH/$apps_dir ]] || fail "Missing apps directory: $apps_dir"
+        for app in "$NEXTCLOUD_PATH/$apps_dir/"*; do
+            [[ -d $app ]] || continue
+            [[ ! -e $stage/nextcloud/apps/${app##*/} ]] || fail "Custom app conflicts with an app shipped by the release: $apps_dir/${app##*/} (apps/${app##*/})"
+        done
+    done < "$workspace/extra-app-paths"
+}
 
 # PHP is already required by Nextcloud; use it for structured data, not regex XML.
 php_info() {
@@ -271,12 +321,7 @@ backup_mode=$(stat -c %a "$BACKUP_PATH")
 [[ ! -e ${NEXTCLOUD_PATH}.old ]] || fail 'Legacy .old directory exists; identify and preserve its recovery state before proceeding.'
 [[ -f $NEXTCLOUD_PATH/occ && -f $NEXTCLOUD_PATH/config/config.php ]] || fail 'Nextcloud files are missing.'
 # Never traverse an application mount or symlink into EFS during copying/ownership.
-mounts=$(findmnt --raw --noheadings --output TARGET)
-while IFS= read -r mount; do
-    [[ $mount != "$NEXTCLOUD_PATH" && $mount != "$NEXTCLOUD_PATH/"* ]] || fail "Mount inside application tree: $mount"
-done <<< "$mounts"
-source_links=$(find "$NEXTCLOUD_PATH" -type l -print -quit)
-[[ -z $source_links ]] || fail 'Symlinks in application tree require a separately reviewed preservation plan.'
+check_application_tree
 data_path=$(realpath -e -- "$(config datadirectory)")
 [[ $data_path != "$NEXTCLOUD_PATH" && $data_path != "$NEXTCLOUD_PATH/"* && $NEXTCLOUD_PATH != "$data_path/"* ]] || fail 'Only an external data directory is supported; no user data will be copied.'
 [[ $BACKUP_PATH != "$data_path" && $BACKUP_PATH != "$data_path/"* ]] || fail 'Recovery backups must be outside the user-data directory.'
@@ -360,6 +405,40 @@ check_space "$parent" "$((unpacked_bytes + app_bytes + 104857600))" "$((entry_co
 stage=$(mktemp -d -p "$parent" .nextcloud-stage.XXXXXXXX)
 cp -a -- "$release" "$stage/nextcloud"
 occ config:list system --output=json | php_info apps "$NEXTCLOUD_PATH" > "$workspace/extra-app-paths"
+check_custom_apps
+
+# Resolve optional copies before maintenance; never merge over release content.
+while IFS= read -r apps_dir; do
+    add_preserved_path "$apps_dir"
+done < "$workspace/extra-app-paths"
+for app in "$NEXTCLOUD_PATH/apps/"*; do
+    [[ -d $app ]] || continue
+    [[ ! -e $stage/nextcloud/apps/${app##*/} ]] || continue
+    if [[ -f $app/appinfo/info.xml ]]; then
+        app_kind=$(php_info custom-app "$app")
+        if [[ $app_kind == no ]]; then
+            log "Not carrying removed shipped app: ${app##*/}"
+            continue
+        fi
+    fi
+    add_preserved_path "apps/${app##*/}"
+done
+for theme in "$NEXTCLOUD_PATH/themes/"*; do
+    [[ -e $theme ]] || continue
+    [[ ${theme##*/} == README || ${theme##*/} == example ]] || add_preserved_path "themes/${theme##*/}"
+done
+if [[ -n $PRESERVE_PATHS_FILE ]]; then
+    [[ -f $PRESERVE_PATHS_FILE && -r $PRESERVE_PATHS_FILE ]] || fail 'PRESERVE_PATHS_FILE must be a readable regular file.'
+    while IFS= read -r path || [[ -n $path ]]; do
+        [[ -n $path && $path != \#* ]] || continue
+        add_preserved_path "$path"
+    done < "$PRESERVE_PATHS_FILE"
+fi
+: > "$workspace/preserved-paths"
+for path in "${preserved_paths[@]}"; do
+    printf '%s\n' "$path" >> "$workspace/preserved-paths"
+    log "Preserving: $path"
+done
 
 # Prepare credentials privately, retaining neither password nor credential file in logs.
 db_type=$(config dbtype); db_name=$(config dbname); db_user=$(config dbuser)
@@ -417,6 +496,7 @@ read -r -p 'Proceed with the upgrade? [y/N]: ' answer
 recovery=$(mktemp -d -p "$BACKUP_PATH" "upgrade-$(date -u +%Y%m%dT%H%M%SZ).XXXXXXXX")
 old_path="${NEXTCLOUD_PATH}.old.${recovery##*/}"
 cp -- "$workspace/cron.original" "$workspace/cron.disabled" "$recovery/"
+cp -- "$workspace/preserved-paths" "$recovery/preserved-paths"
 printf 'installation=%s\nprevious_version=%s\ntarget_version=%s\nold_application=%s\nstaging=%s\nworkspace=%s\ndatabase_type=%s\ndatabase_name=%s\nservice_manager=%s\nweb_service=%s\nphp_service=%s\n' \
     "$NEXTCLOUD_PATH" "$current_version" "$download_version" "$old_path" "$stage" "$workspace" "$db_type" "$db_name" "$SERVICE_MANAGER" "$WEB_SERVICE" "$PHP_SERVICE" > "$recovery/manifest"
 set_phase quiescing "Enabling maintenance, disabling Nextcloud cron, and stopping application services through $SERVICE_MANAGER."
@@ -440,6 +520,10 @@ for ((elapsed=0; ; elapsed++)); do
         break
     fi
 done
+# Recheck after shutdown in case a selected source or mount changed since preflight.
+check_application_tree
+check_custom_apps
+for path in "${preserved_paths[@]}"; do check_preserved_path "$path"; done
 set_phase backup 'Creating and validating recovery backups.'
 if [[ $db_type == mysql ]]; then
     "$dump_cmd" --defaults-file="$credentials" --single-transaction --quick --default-character-set=utf8mb4 --comments --dump-date "$db_name" > "$recovery/database.sql.part"
@@ -459,26 +543,10 @@ cp -a -- "$NEXTCLOUD_PATH/config" "$recovery/config"
 # Keep all config fragments and known installation-specific application components.
 rm -rf -- "$stage/nextcloud/config"
 cp -a -- "$NEXTCLOUD_PATH/config" "$stage/nextcloud/config"
-while IFS= read -r apps_dir; do
-    [[ -d $NEXTCLOUD_PATH/$apps_dir ]] || fail "Missing apps directory: $apps_dir"
-    mkdir -p -- "$stage/nextcloud/$apps_dir"
-    cp -a -- "$NEXTCLOUD_PATH/$apps_dir/." "$stage/nextcloud/$apps_dir/"
-done < "$workspace/extra-app-paths"
-for app in "$NEXTCLOUD_PATH/apps/"*; do
-    [[ -d $app ]] || continue
-    [[ ! -e $stage/nextcloud/apps/${app##*/} ]] || continue
-    if [[ -f $app/appinfo/info.xml ]]; then
-        app_kind=$(php_info custom-app "$app")
-        if [[ $app_kind == no ]]; then
-            log "Not carrying removed shipped app: ${app##*/}"
-            continue
-        fi
-    fi
-    cp -a -- "$app" "$stage/nextcloud/apps/"
-done
-for theme in "$NEXTCLOUD_PATH/themes/"*; do
-    [[ -e $theme ]] || continue
-    [[ ${theme##*/} == README || ${theme##*/} == example ]] || cp -a -- "$theme" "$stage/nextcloud/themes/"
+for path in "${preserved_paths[@]}"; do
+    check_preserved_path "$path"
+    mkdir -p -- "$(dirname -- "$stage/nextcloud/$path")"
+    cp -aT -- "$NEXTCLOUD_PATH/$path" "$stage/nextcloud/$path"
 done
 for file in .htaccess .user.ini; do
     [[ ! -f $NEXTCLOUD_PATH/$file ]] || cp -a -- "$NEXTCLOUD_PATH/$file" "$stage/nextcloud/$file"
