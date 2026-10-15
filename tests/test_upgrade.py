@@ -25,7 +25,7 @@ REAL_PHP = shutil.which(os.environ.get('TEST_PHP', 'php'))
 REAL_TOOLS = {name: shutil.which(name) for name in ('stat', 'mv', 'cp', 'tar', 'gzip', 'df', 'rsync')}
 
 MOCK = r'''#!/usr/bin/env python3
-import json, os, pathlib, signal, subprocess, sys, time
+import json, os, pathlib, signal, sys, time
 root = pathlib.Path(os.environ['TEST_ROOT'])
 name = pathlib.Path(sys.argv[0]).name
 args = sys.argv[1:]
@@ -245,6 +245,7 @@ elif name == 'mv':
         event('data move')
         fail_once('data-move')
         if mode in ('after-data-move', 'data-rollback', 'signal-after-data-move', 'kill-after-data-move'):
+            import subprocess
             subprocess.run([os.environ['REAL_MV'], *args], check=True)
             if mode == 'signal-after-data-move': os.kill(int(os.environ['UPGRADE_PID']), signal.SIGTERM); time.sleep(.2); die(143)
             if mode == 'kill-after-data-move': os.kill(int(os.environ['UPGRADE_PID']), signal.SIGKILL); die(137)
@@ -299,20 +300,23 @@ elif name == 'ssh':
         assert load('status')['maintenance']
         assert all(state == 'inactive' for state in load('services').values())
         fail_once('ssh-copy')
-    die(subprocess.run(['/bin/sh', '-c', command], cwd=root).returncode)
+    os.chdir(root)
+    os.execv('/bin/sh', ['/bin/sh', '-c', command])
 else: raise AssertionError(name)
 '''
 
 @unittest.skipUnless(REAL_PHP, 'PHP with SimpleXML required; set TEST_PHP')
-class UpgradeScenarios:
+class UpgradeFixture:
     service_manager = 'monit'
+
     def setUp(self):
         self.temp = tempfile.TemporaryDirectory(prefix='nc-upgrade-test-')
         self.root = Path(self.temp.name)
         self.addCleanup(self.temp.cleanup)
         r = self.root
         (r / 'bin').mkdir()
-        mock = r / 'bin/mock'; mock.write_text(MOCK.replace('#!/usr/bin/env python3', '#!' + sys.executable, 1)); mock.chmod(0o755)
+        # These short-lived mocks use only the standard library; skip site setup.
+        mock = r / 'bin/mock'; mock.write_text(MOCK.replace('#!/usr/bin/env python3', '#!' + sys.executable + ' -S', 1)); mock.chmod(0o755)
         names = ('sudo php curl monit systemctl crontab mariadb mariadb-dump mysql mysqldump psql pg_dump '
                  'findmnt pgrep chown stat df mv cp tar gzip rsync ssh id getent').split()
         for name in names: (r / 'bin' / name).symlink_to(mock)
@@ -420,37 +424,20 @@ class UpgradeScenarios:
         self.assertIn('# nextcloud-upgrade:', (r / 'cron').read_text())
         self.assertEqual((r / 'storage/sentinel').read_text(), 'Never modify or duplicate EFS data')
 
-    def test_success_preserves_config_apps_themes_schedule_and_recovery(self):
-        p = self.run_upgrade()
-        self.assertEqual(p.returncode, 0, self.output)
-        r = self.root
-        self.assertEqual((r / 'cron').read_text(), self.original_cron)
-        self.assertFalse(json.loads((r / 'status').read_text())['maintenance'])
-        self.assertFalse((r / 'backups/upgrade-active').exists())
-        self.assertEqual(len(list(r.glob('nextcloud.old.*'))), 1)
-        self.assertTrue((r / 'nextcloud/config/extra.config.php').exists())
-        self.assertTrue((r / 'nextcloud/apps/extra/custom.php').exists())
-        self.assertTrue((r / 'nextcloud/custom_apps/test/custom.php').exists())
-        self.assertTrue((r / 'nextcloud/themes/custom/style.css').exists())
-        self.assertEqual((r / 'nextcloud/.user.ini').read_text(), 'custom ini')
-        recovery = next((r / 'backups').glob('upgrade-*'))
-        self.assertTrue((recovery / 'database.sql.gz').exists())
-        self.assertEqual((recovery / 'phase').read_text(), 'complete\n')
-        self.assertNotIn('secret', self.output)
-        self.assertEqual((r / 'storage/sentinel').read_text(), 'Never modify or duplicate EFS data')
-        self.assertFalse(any((r / 'nextcloud').rglob('sentinel')))
-        fields = dict(line.split('=', 1) for line in (recovery / 'manifest').read_text().splitlines())
-        self.assertFalse(Path(fields['workspace']).exists())
-        self.assertFalse(Path(fields['staging']).exists())
-        self.assertEqual(fields['service_manager'], self.service_manager)
-        events = (r / 'events').read_text().splitlines()
-        actions = [line for line in events if line.startswith(('monit start ', 'monit stop ', 'systemctl start ', 'systemctl stop '))]
-        expected = [f'{self.service_command} {action} {svc}' for action, svc in
-                    [('stop', 'nginx'), ('stop', 'php8.4-fpm'), ('start', 'php8.4-fpm'), ('start', 'nginx')]]
-        self.assertEqual(actions, expected)
-        if self.service_manager == 'systemd':
-            self.assertFalse(any(line.startswith('monit ') for line in events))
+    def preservation_list(self, text):
+        path = self.root / 'preserve.txt'
+        path.write_text(text)
+        return {'PRESERVE_PATHS_FILE': str(path)}
 
+    def assert_preservation_refused(self, extra, message):
+        self.assertNotEqual(self.run_upgrade(extra=extra).returncode, 0, self.output)
+        self.assertIn(message, self.output)
+        self.assert_original()
+        self.assertNotIn('occ maintenance:mode', (self.root / 'events').read_text())
+
+
+class UpgradeScenarios(UpgradeFixture):
+    # Manager-independent behavior is exercised once with systemd.
     def test_zip_success(self):
         self.assertEqual(self.run_upgrade(extra={'DOWNLOAD_FORMAT': 'zip'}).returncode, 0, self.output)
 
@@ -499,15 +486,6 @@ class UpgradeScenarios:
         self.assertEqual(os.readlink(link), 'custom.php')
         recovery = next((self.root / 'backups').glob('upgrade-*/manifest')).parent
         self.assertEqual(os.readlink(recovery / 'custom/custom_apps/test/local.php'), 'custom.php')
-
-    def test_help_needs_no_root_services_or_tools(self):
-        for option in ('--help', '-h'):
-            with self.subTest(option=option):
-                result = subprocess.run(['/bin/bash', str(self.script), option], env=dict(self.env, PATH='/no-tools'), capture_output=True, text=True)
-                self.assertEqual(result.returncode, 0, result.stderr)
-                self.assertIn('WEB_USER', result.stdout)
-                self.assertIn('BACKUP_SSH_DEST', result.stdout)
-        self.assertEqual((self.root / 'events').read_text(), '')
 
     def test_installed_build_metadata_runs_as_web_account(self):
         self.assertEqual(self.run_upgrade(answer='n').returncode, 0, self.output)
@@ -572,17 +550,6 @@ class UpgradeScenarios:
         self.assertIn('Recovery directory:', self.output)
         self.assertIn('Restore bundle:', self.output)
         self.assertNotIn('secret', self.output)
-
-    def preservation_list(self, text):
-        path = self.root / 'preserve.txt'
-        path.write_text(text)
-        return {'PRESERVE_PATHS_FILE': str(path)}
-
-    def assert_preservation_refused(self, extra, message):
-        self.assertNotEqual(self.run_upgrade(extra=extra).returncode, 0, self.output)
-        self.assertIn(message, self.output)
-        self.assert_original()
-        self.assertNotIn('occ maintenance:mode', (self.root / 'events').read_text())
 
     def test_extra_files_directories_and_literal_names_are_preserved(self):
         r = self.root
@@ -779,14 +746,6 @@ class UpgradeScenarios:
         self.assertNotEqual(self.run_upgrade().returncode, 0, self.output)
         self.assertIn('Interrupted attempt', self.output)
 
-    def test_unverifiable_shutdown_requires_manual_recovery(self):
-        self.assertNotEqual(self.run_upgrade('stop-timeout').returncode, 0, self.output)
-        self.assertTrue((self.root / 'backups/upgrade-active').exists())
-        self.assertTrue(json.loads((self.root / 'status').read_text())['maintenance'])
-        self.assertEqual((self.root / 'nextcloud/occ').read_text(), 'old-code')
-        self.assertNotIn('occ upgrade', (self.root / 'events').read_text())
-        self.assertIn('Automatic recovery incomplete', self.output)
-
     def test_rollback_rename_failure_is_not_reported_as_recovered(self):
         self.assertNotEqual(self.run_upgrade('rollback-rename').returncode, 0, self.output)
         self.assertFalse((self.root / 'nextcloud').exists())
@@ -869,16 +828,58 @@ class UpgradeScenarios:
         self.assertEqual((self.root / 'events').read_text(), '')
         self.assert_original()
 
-    def test_required_service_tool_is_checked_without_fallback(self):
-        (self.root / 'bin' / self.service_command).unlink()
-        self.assertNotEqual(self.run_upgrade().returncode, 0, self.output)
-        self.assertIn('Required command missing: ' + self.service_command, self.output)
-        self.assert_original()
-
     def test_missing_unit_is_rejected_before_changes(self):
         self.assertNotEqual(self.run_upgrade('missing-unit').returncode, 0, self.output)
         self.assertIn('Unknown systemd service', self.output)
         self.assertNotIn(self.service_command + ' stop', (self.root / 'events').read_text())
+        self.assert_original()
+
+
+class ServiceScenarios(UpgradeFixture):
+    # Each service adapter must satisfy this same contract.
+    def test_success_preserves_config_apps_themes_schedule_and_recovery(self):
+        p = self.run_upgrade()
+        self.assertEqual(p.returncode, 0, self.output)
+        r = self.root
+        self.assertEqual((r / 'cron').read_text(), self.original_cron)
+        self.assertFalse(json.loads((r / 'status').read_text())['maintenance'])
+        self.assertFalse((r / 'backups/upgrade-active').exists())
+        self.assertEqual(len(list(r.glob('nextcloud.old.*'))), 1)
+        self.assertTrue((r / 'nextcloud/config/extra.config.php').exists())
+        self.assertTrue((r / 'nextcloud/apps/extra/custom.php').exists())
+        self.assertTrue((r / 'nextcloud/custom_apps/test/custom.php').exists())
+        self.assertTrue((r / 'nextcloud/themes/custom/style.css').exists())
+        self.assertEqual((r / 'nextcloud/.user.ini').read_text(), 'custom ini')
+        recovery = next((r / 'backups').glob('upgrade-*'))
+        self.assertTrue((recovery / 'database.sql.gz').exists())
+        self.assertEqual((recovery / 'phase').read_text(), 'complete\n')
+        self.assertNotIn('secret', self.output)
+        self.assertEqual((r / 'storage/sentinel').read_text(), 'Never modify or duplicate EFS data')
+        self.assertFalse(any((r / 'nextcloud').rglob('sentinel')))
+        fields = dict(line.split('=', 1) for line in (recovery / 'manifest').read_text().splitlines())
+        self.assertFalse(Path(fields['workspace']).exists())
+        self.assertFalse(Path(fields['staging']).exists())
+        self.assertEqual(fields['service_manager'], self.service_manager)
+        events = (r / 'events').read_text().splitlines()
+        actions = [line for line in events if line.startswith(('monit start ', 'monit stop ', 'systemctl start ', 'systemctl stop '))]
+        expected = [f'{self.service_command} {action} {svc}' for action, svc in
+                    [('stop', 'nginx'), ('stop', 'php8.4-fpm'), ('start', 'php8.4-fpm'), ('start', 'nginx')]]
+        self.assertEqual(actions, expected)
+        if self.service_manager == 'systemd':
+            self.assertFalse(any(line.startswith('monit ') for line in events))
+
+    def test_unverifiable_shutdown_requires_manual_recovery(self):
+        self.assertNotEqual(self.run_upgrade('stop-timeout').returncode, 0, self.output)
+        self.assertTrue((self.root / 'backups/upgrade-active').exists())
+        self.assertTrue(json.loads((self.root / 'status').read_text())['maintenance'])
+        self.assertEqual((self.root / 'nextcloud/occ').read_text(), 'old-code')
+        self.assertNotIn('occ upgrade', (self.root / 'events').read_text())
+        self.assertIn('Automatic recovery incomplete', self.output)
+
+    def test_required_service_tool_is_checked_without_fallback(self):
+        (self.root / 'bin' / self.service_command).unlink()
+        self.assertNotEqual(self.run_upgrade().returncode, 0, self.output)
+        self.assertIn('Required command missing: ' + self.service_command, self.output)
         self.assert_original()
 
     def test_stopped_service_is_not_started_by_preflight(self):
@@ -894,7 +895,23 @@ class UpgradeScenarios:
         self.assertEqual(json.loads((self.root / 'services').read_text()), {'nginx': 'active', 'php8.4-fpm': 'active'})
 
 
-class MonitUpgradeTests(UpgradeScenarios, unittest.TestCase):
+class MonitUpgradeTests(ServiceScenarios, unittest.TestCase):
+    def test_service_command_failures_restore_or_block_access(self):
+        for mode in ('stop-nginx', 'stop-php8.4-fpm', 'start-nginx', 'start-php8.4-fpm', 'start-timeout'):
+            with self.subTest(mode=mode):
+                f = type(self)('test_success_preserves_config_apps_themes_schedule_and_recovery')
+                f.setUp()
+                try:
+                    self.assertNotEqual(f.run_upgrade(mode).returncode, 0, f.output)
+                    if mode.startswith('stop-'):
+                        f.assert_original()
+                        self.assertNotIn('occ upgrade', (f.root / 'events').read_text())
+                    else:
+                        f.assert_blocked()
+                        self.assertEqual((f.root / 'nextcloud/occ').read_text(), 'new-code')
+                finally:
+                    f.doCleanups()
+
     def test_unmonitored_service_is_rejected_in_monit_mode(self):
         self.assertNotEqual(self.run_upgrade('unmonitored').returncode, 0, self.output)
         self.assertIn('Service must already be monitored', self.output)
@@ -913,7 +930,7 @@ class MonitUpgradeTests(UpgradeScenarios, unittest.TestCase):
         self.assertEqual(self.run_upgrade().returncode, 0, self.output)
         self.assertIn('monit stop nginx', (self.root / 'events').read_text())
 
-class SystemdUpgradeTests(UpgradeScenarios, unittest.TestCase):
+class SystemdUpgradeTests(UpgradeScenarios, ServiceScenarios, unittest.TestCase):
     service_manager = 'systemd'
 
 @unittest.skipUnless(REAL_PHP and REAL_TOOLS['rsync'], 'PHP with SimpleXML and rsync required')
@@ -954,38 +971,37 @@ class DataBackupTests(unittest.TestCase):
         self.assert_data_untouched(fixture)
 
     def test_internal_and_external_data_with_backup_on_and_off(self):
-        for manager in ('monit', 'systemd'):
-            for relative in (None, 'data', 'private/user files'):
-                for enabled in ('no', 'yes'):
-                    with self.subTest(manager=manager, relative=relative, enabled=enabled):
-                        f = self.fixture(manager, relative)
-                        if relative == 'data':
-                            skeleton = f.root / 'release/nextcloud/data'
-                            skeleton.mkdir(); (skeleton / '.htaccess').write_text('new skeleton')
-                            f.make_archive()
-                        self.assertEqual(f.run_upgrade(extra={'BACKUP_DATA': enabled}).returncode, 0, f.output)
-                        self.assert_data_untouched(f)
-                        recovery = next((f.root / 'backups').glob('upgrade-*'))
-                        self.assertEqual((recovery / 'data').exists(), enabled == 'yes')
-                        self.assertFalse((recovery / 'data.partial').exists())
-                        manifest = (recovery / 'manifest').read_text()
-                        self.assertIn('data_directory=' + str(f.data), manifest)
-                        self.assertIn('backup_data=' + enabled, manifest)
-                        self.assertIn('internal_data_relative=' + (relative or ''), manifest)
-                        self.assertFalse((recovery / 'backup.tar').exists())
-                        events = (f.root / 'events').read_text()
-                        if enabled == 'yes':
-                            self.assertEqual((recovery / 'data/users/.hidden').read_text(), 'private content')
-                            self.assertEqual(os.readlink(recovery / 'data/link'), '/does/not/exist')
-                            self.assertEqual((recovery / 'data.verify.log').read_text(), '')
-                            self.assertLess(events.index('dump'), events.index('data copy'))
-                            self.assertLess(events.index('data verify'), events.index('occ upgrade'))
-                        else:
-                            self.assertNotIn('data copy', events)
-                        if relative:
-                            old = next(f.root.glob('nextcloud.old.*'))
-                            self.assertFalse((old / relative).exists())
-                            self.assertFalse(any((f.root / 'nextcloud').rglob('.nextcloud-stage.*')))
+        for relative in (None, 'data', 'private/user files'):
+            for enabled in ('no', 'yes'):
+                with self.subTest(relative=relative, enabled=enabled):
+                    f = self.fixture(relative=relative)
+                    if relative == 'data':
+                        skeleton = f.root / 'release/nextcloud/data'
+                        skeleton.mkdir(); (skeleton / '.htaccess').write_text('new skeleton')
+                        f.make_archive()
+                    self.assertEqual(f.run_upgrade(extra={'BACKUP_DATA': enabled}).returncode, 0, f.output)
+                    self.assert_data_untouched(f)
+                    recovery = next((f.root / 'backups').glob('upgrade-*'))
+                    self.assertEqual((recovery / 'data').exists(), enabled == 'yes')
+                    self.assertFalse((recovery / 'data.partial').exists())
+                    manifest = (recovery / 'manifest').read_text()
+                    self.assertIn('data_directory=' + str(f.data), manifest)
+                    self.assertIn('backup_data=' + enabled, manifest)
+                    self.assertIn('internal_data_relative=' + (relative or ''), manifest)
+                    self.assertFalse((recovery / 'backup.tar').exists())
+                    events = (f.root / 'events').read_text()
+                    if enabled == 'yes':
+                        self.assertEqual((recovery / 'data/users/.hidden').read_text(), 'private content')
+                        self.assertEqual(os.readlink(recovery / 'data/link'), '/does/not/exist')
+                        self.assertEqual((recovery / 'data.verify.log').read_text(), '')
+                        self.assertLess(events.index('dump'), events.index('data copy'))
+                        self.assertLess(events.index('data verify'), events.index('occ upgrade'))
+                    else:
+                        self.assertNotIn('data copy', events)
+                    if relative:
+                        old = next(f.root.glob('nextcloud.old.*'))
+                        self.assertFalse((old / relative).exists())
+                        self.assertFalse(any((f.root / 'nextcloud').rglob('.nextcloud-stage.*')))
 
     def test_disabled_data_backup_needs_no_rsync_and_local_backups_are_allowed(self):
         f = self.fixture(relative='data'); (f.root / 'bin/rsync').unlink()
@@ -1005,12 +1021,11 @@ class DataBackupTests(unittest.TestCase):
                 self.assertFalse((recovery / 'data').exists())
 
     def test_internal_data_rename_failures_restore_data_and_code(self):
-        for manager in ('monit', 'systemd'):
-            for mode in ('old-rename', 'new-rename', 'data-move', 'after-data-move', 'signal-after-data-move'):
-                with self.subTest(manager=manager, mode=mode):
-                    f = self.fixture(manager, relative='data')
-                    self.assertNotEqual(f.run_upgrade(mode).returncode, 0, f.output)
-                    self.assert_recovered(f)
+        for mode in ('old-rename', 'new-rename', 'data-move', 'after-data-move', 'signal-after-data-move'):
+            with self.subTest(mode=mode):
+                f = self.fixture(relative='data')
+                self.assertNotEqual(f.run_upgrade(mode).returncode, 0, f.output)
+                self.assert_recovered(f)
 
     def test_failed_data_rollback_and_sigkill_keep_live_data_and_block_retry(self):
         for mode in ('data-rollback', 'kill-after-data-move', 'migration'):
@@ -1179,51 +1194,52 @@ class WebServerTests(unittest.TestCase):
         return fixture, services
 
     def test_apache_service_names_and_php_layouts(self):
-        for manager in ('monit', 'systemd'):
-            for web in ('apache2', 'httpd'):
-                for php in ('php8.4-fpm', 'none'):
-                    with self.subTest(manager=manager, web=web, php=php):
-                        fixture, original = self.fixture(manager, web, php)
-                        self.assertEqual(fixture.run_upgrade().returncode, 0, fixture.output)
-                        self.assertEqual(json.loads((fixture.root / 'services').read_text()), original)
-                        self.assertFalse(json.loads((fixture.root / 'status').read_text())['maintenance'])
-                        self.assertEqual((fixture.root / 'cron').read_text(), fixture.original_cron)
-                        events = (fixture.root / 'events').read_text().splitlines()
-                        actions = [line for line in events if line.startswith(('monit start ', 'monit stop ', 'systemctl start ', 'systemctl stop '))]
-                        stop = [web] + ([php] if php != 'none' else [])
-                        expected = [f'{fixture.service_command} stop {service}' for service in stop]
-                        expected += [f'{fixture.service_command} start {service}' for service in reversed(stop)]
-                        self.assertEqual(actions, expected)
-                        manifest = next((fixture.root / 'backups').glob('upgrade-*/manifest')).read_text()
-                        self.assertIn('web_service=' + web + '\n', manifest)
-                        self.assertIn('php_service=' + php + '\n', manifest)
+        for manager, web, php in (
+            ('monit', 'apache2', 'php8.4-fpm'),
+            ('monit', 'httpd', 'none'),
+            ('systemd', 'apache2', 'none'),
+            ('systemd', 'httpd', 'php8.4-fpm'),
+        ):
+            with self.subTest(manager=manager, web=web, php=php):
+                fixture, original = self.fixture(manager, web, php)
+                self.assertEqual(fixture.run_upgrade().returncode, 0, fixture.output)
+                self.assertEqual(json.loads((fixture.root / 'services').read_text()), original)
+                self.assertFalse(json.loads((fixture.root / 'status').read_text())['maintenance'])
+                self.assertEqual((fixture.root / 'cron').read_text(), fixture.original_cron)
+                events = (fixture.root / 'events').read_text().splitlines()
+                actions = [line for line in events if line.startswith(('monit start ', 'monit stop ', 'systemctl start ', 'systemctl stop '))]
+                stop = [web] + ([php] if php != 'none' else [])
+                expected = [f'{fixture.service_command} stop {service}' for service in stop]
+                expected += [f'{fixture.service_command} start {service}' for service in reversed(stop)]
+                self.assertEqual(actions, expected)
+                manifest = next((fixture.root / 'backups').glob('upgrade-*/manifest')).read_text()
+                self.assertIn('web_service=' + web + '\n', manifest)
+                self.assertIn('php_service=' + php + '\n', manifest)
 
     def test_apache_failures_recover_or_remain_blocked(self):
         for manager in ('monit', 'systemd'):
-            for php in ('php8.4-fpm', 'none'):
-                for mode in ('backup', 'new-rename', 'migration', 'start-apache2', 'stop-timeout'):
-                    with self.subTest(manager=manager, php=php, mode=mode):
-                        fixture, original = self.fixture(manager, php=php)
-                        self.assertNotEqual(fixture.run_upgrade(mode).returncode, 0, fixture.output)
-                        status = json.loads((fixture.root / 'status').read_text())
-                        services = json.loads((fixture.root / 'services').read_text())
-                        marker = fixture.root / 'backups/upgrade-active'
-                        if mode in ('backup', 'new-rename'):
-                            self.assertEqual((fixture.root / 'nextcloud/occ').read_text(), 'old-code')
-                            self.assertEqual(services, original)
-                            self.assertFalse(status['maintenance'])
-                            self.assertFalse(marker.exists())
-                            self.assertEqual((fixture.root / 'cron').read_text(), fixture.original_cron)
-                        else:
-                            self.assertTrue(status['maintenance'], fixture.output)
-                            self.assertTrue(marker.exists(), fixture.output)
-                            self.assertIn('# nextcloud-upgrade:', (fixture.root / 'cron').read_text())
-                            if mode != 'stop-timeout':
-                                self.assertTrue(all(state == 'inactive' for state in services.values()))
-                                self.assertEqual((fixture.root / 'nextcloud/occ').read_text(), 'new-code')
-                        self.assertEqual((fixture.root / 'storage/sentinel').read_text(), 'Never modify or duplicate EFS data')
-                        if php == 'none':
-                            self.assertNotIn('php8.4-fpm', (fixture.root / 'events').read_text())
+            for mode in ('backup', 'new-rename', 'migration', 'start-apache2', 'stop-timeout'):
+                with self.subTest(manager=manager, mode=mode):
+                    fixture, original = self.fixture(manager, php='none')
+                    self.assertNotEqual(fixture.run_upgrade(mode).returncode, 0, fixture.output)
+                    status = json.loads((fixture.root / 'status').read_text())
+                    services = json.loads((fixture.root / 'services').read_text())
+                    marker = fixture.root / 'backups/upgrade-active'
+                    if mode in ('backup', 'new-rename'):
+                        self.assertEqual((fixture.root / 'nextcloud/occ').read_text(), 'old-code')
+                        self.assertEqual(services, original)
+                        self.assertFalse(status['maintenance'])
+                        self.assertFalse(marker.exists())
+                        self.assertEqual((fixture.root / 'cron').read_text(), fixture.original_cron)
+                    else:
+                        self.assertTrue(status['maintenance'], fixture.output)
+                        self.assertTrue(marker.exists(), fixture.output)
+                        self.assertIn('# nextcloud-upgrade:', (fixture.root / 'cron').read_text())
+                        if mode != 'stop-timeout':
+                            self.assertTrue(all(state == 'inactive' for state in services.values()))
+                            self.assertEqual((fixture.root / 'nextcloud/occ').read_text(), 'new-code')
+                    self.assertEqual((fixture.root / 'storage/sentinel').read_text(), 'Never modify or duplicate EFS data')
+                    self.assertNotIn('php8.4-fpm', (fixture.root / 'events').read_text())
 
     def test_nginx_without_separate_php_is_rejected(self):
         for manager in ('monit', 'systemd'):

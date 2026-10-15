@@ -13,13 +13,4 @@ if (PHP_VERSION_ID < 80400 || !extension_loaded("SimpleXML")) {
     fwrite(STDERR, "Tests require PHP 8.4 or newer with SimpleXML.\n");
     exit(1);
 }'
-TEST_PHP="$php_bin" python3 -B - <<'PY'
-import sys
-import unittest
-
-suite = unittest.defaultTestLoader.discover('tests', pattern='test_*.py')
-result = unittest.TextTestRunner(verbosity=2).run(suite)
-if result.skipped:
-    print('Skipped tests are a failure: install the missing test dependencies.', file=sys.stderr)
-sys.exit(0 if result.wasSuccessful() and not result.skipped and result.testsRun else 1)
-PY
+TEST_PHP="$php_bin" python3 -B tests/run.py

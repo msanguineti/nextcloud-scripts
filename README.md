@@ -309,9 +309,16 @@ cd nextcloud-scripts
 TEST_PHP=/usr/bin/php8.4 bash .github/scripts/check.sh
 ```
 
-The check command runs shell validation and all tests. Tests use temporary files
-and simulated services, databases and GitHub requests; no root access, Docker or
-live Nextcloud server is needed. CI runs the same checks on PRs and `main` pushes.
+The check command runs shell validation and all tests with two worker processes
+(or one on a single-CPU machine), and reports the slowest tests. Set `TEST_JOBS=1`
+for sequential execution. To run one test:
+
+```bash
+TEST_PHP=/usr/bin/php8.4 python3 -B -m unittest discover -s tests -k test_zip_success -v
+```
+
+Tests use temporary files and simulated services, databases and GitHub requests;
+no root access, Docker or live Nextcloud server is needed. CI runs the same checks on PRs and `main` pushes.
 
 The upgrade flow is in `nextcloud-upgrade.sh`. `set_phase` records progress and
 `on_exit` handles recovery; automatic rollback ends when database migration
