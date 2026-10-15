@@ -19,7 +19,11 @@ DOWNLOAD_FORMAT="${DOWNLOAD_FORMAT:-tar.bz2}"
 CHECKSUM_TYPE="${CHECKSUM_TYPE:-sha256}"
 # Plain text, one installation-relative path per line; never sourced as shell code.
 PRESERVE_PATHS_FILE="${PRESERVE_PATHS_FILE:-}"
+BACKUP_DATA="${BACKUP_DATA:-no}"
+BACKUP_ARCHIVE="${BACKUP_ARCHIVE:-no}"
+BACKUP_SSH_DEST="${BACKUP_SSH_DEST:-}"
 preserved_paths=()
+data_relative=''
 
 phase=preflight
 workspace='' stage='' recovery='' old_path='' credentials=''
@@ -29,19 +33,42 @@ migration_started=no
 cron_changed=no
 finished=no
 
-log() { printf '[%s] %s\n' "$phase" "$*"; }
-fail() { log "ERROR: $*" >&2; exit 1; }
+log() {
+    local symbol='[i]' color=36
+    case ${1:-} in
+        --info) shift ;;
+        --success) symbol='[✓]'; color=32; shift ;;
+        --warning) symbol='[!]'; color=33; shift ;;
+        --error) symbol='[x]'; color=31; shift ;;
+        --question) symbol='[?]'; color=34; shift ;;
+    esac
+    if [[ -t 1 && ${TERM:-dumb} != dumb && -z ${NO_COLOR+x} ]]; then
+        printf '\033[1;%sm%s\033[0m [%s] %s\n' "$color" "$symbol" "$phase" "$*"
+    else
+        printf '%s [%s] %s\n' "$symbol" "$phase" "$*"
+    fi
+}
+fail() { log --error "ERROR: $*" >&2; exit 1; }
 need() { command -v "$1" >/dev/null || fail "Required command missing: $1"; }
 occ() { (cd "$NEXTCLOUD_PATH" && sudo -u www-data php ./occ "$@"); }
 config() { occ config:system:get "$1"; }
+
+find_application() {
+    if [[ -n $data_relative ]]; then
+        find "$NEXTCLOUD_PATH" -samefile "$data_path" -prune -o "$@"
+    else
+        find "$NEXTCLOUD_PATH" "$@"
+    fi
+}
 
 check_application_tree() {
     local mounts mount unsupported
     mounts=$(findmnt --raw --noheadings --output TARGET)
     while IFS= read -r mount; do
+        printf -v mount '%b' "$mount" # findmnt --raw escapes spaces and backslashes.
         [[ $mount != "$NEXTCLOUD_PATH" && $mount != "$NEXTCLOUD_PATH/"* ]] || fail "Mount inside application tree: $mount"
     done <<< "$mounts"
-    unsupported=$(find "$NEXTCLOUD_PATH" ! -type d ! -type f -print -quit)
+    unsupported=$(find_application ! -type d ! -type f -print -quit)
     [[ -z $unsupported ]] || fail "Only regular files and directories are supported in the application tree (no symlinks): $unsupported"
 }
 
@@ -53,6 +80,9 @@ check_preserved_path() {
         config|config/*|data|data/*|.htaccess|.htaccess/*|.user.ini|.user.ini/*)
             fail "Preservation path is reserved or already handled automatically: $path" ;;
     esac
+    if [[ -n $data_relative ]]; then
+        [[ $path != "$data_relative" && $path != "$data_relative/"* && $data_relative != "$path/"* ]] || fail "User data is handled separately, not as a custom preservation path: $path"
+    fi
     [[ -f $NEXTCLOUD_PATH/$path || -d $NEXTCLOUD_PATH/$path ]] || fail "Missing preservation file or directory: $path"
     [[ $(realpath -e -- "$NEXTCLOUD_PATH/$path") == "$NEXTCLOUD_PATH/$path" ]] || fail "Preservation path must not traverse symlinks: $path"
     [[ ! -e $stage/nextcloud/$path && ! -L $stage/nextcloud/$path ]] || fail "Preservation path would overwrite a release file or directory: $path"
@@ -80,6 +110,64 @@ check_custom_apps() {
             [[ ! -e $stage/nextcloud/apps/${app##*/} ]] || fail "Custom app conflicts with an app shipped by the release: $apps_dir/${app##*/} (apps/${app##*/})"
         done
     done < "$workspace/extra-app-paths"
+}
+
+backup_data() {
+    log "Copying user data from $data_path; services remain stopped."
+    mkdir -- "$recovery/data.partial"
+    rsync -aHAX --numeric-ids -- "$data_path/" "$recovery/data.partial/"
+    # Read both copies to verify content and metadata, without modifying either.
+    rsync -aHAXnc --numeric-ids --delete --itemize-changes -- "$data_path/" "$recovery/data.partial/" > "$recovery/data.verify.log"
+    [[ ! -s $recovery/data.verify.log ]] || fail 'Data backup verification found differences; keep data.partial for inspection.'
+    sync -f "$recovery/data.partial"
+    mv -T -- "$recovery/data.partial" "$recovery/data"
+    log --success 'Data backup copied and verified.'
+}
+
+shell_quote() { printf "'%s'" "${1//\'/\'\\\'\'}"; }
+backup_stream() {
+    local entries=(config database.sql.gz manifest preserved-paths cron.original cron.disabled phase)
+    if [[ -d $recovery/custom ]]; then entries+=(custom); fi
+    if [[ $BACKUP_DATA == yes ]]; then entries+=(data data.verify.log); fi
+    tar --acls --xattrs --numeric-owner -cf - -C "$recovery" -- "${entries[@]}"
+}
+package_backups() {
+    log 'Packaging recovery backups into backup.tar.'
+    backup_stream > "$recovery/backup.tar.partial"
+    tar -tf "$recovery/backup.tar.partial" > /dev/null
+    mv -T -- "$recovery/backup.tar.partial" "$recovery/backup.tar"
+    (cd "$recovery" && sha256sum backup.tar > backup.tar.sha256)
+    sync -f "$recovery"
+    log --success 'Restore bundle created with its SHA256 checksum.'
+}
+backup_ssh() {
+    ssh -T -o BatchMode=yes -o StrictHostKeyChecking=yes -o ConnectTimeout=15 \
+        -o ServerAliveInterval=30 -o ServerAliveCountMax=3 -- "$ssh_host" "$1"
+}
+copy_backups_offsite() {
+    local remote_file remote_partial
+    remote_file=$(shell_quote "$ssh_directory/${recovery##*/}.tar")
+    remote_partial=$(shell_quote "$ssh_directory/${recovery##*/}.tar.partial")
+    log "Sending recovery backup archive to $ssh_host."
+    # SSH authenticates the transfer; archive metadata survives non-root storage.
+    # Noclobber and unique attempt names preserve previous remote backups.
+    local command="set -e; umask 077; set -C; test ! -e $remote_file; test ! -L $remote_file; cat > $remote_partial; tar -tf $remote_partial > /dev/null; mv -T -- $remote_partial $remote_file; sync -f $remote_file"
+    if [[ $BACKUP_ARCHIVE == yes ]]; then
+        backup_ssh "$command" < "$recovery/backup.tar"
+    else
+        backup_stream | backup_ssh "$command"
+    fi
+    log --success 'Recovery backup archive copied off-server.'
+}
+
+# The data directory follows the code replacement by rename, never by chmod/copy.
+restore_internal_data() {
+    [[ -n $data_relative ]] || return 0
+    if [[ -d $old_path/$data_relative && ! -e $NEXTCLOUD_PATH/$data_relative && ! -L $NEXTCLOUD_PATH/$data_relative ]]; then
+        return 0
+    fi
+    [[ ! -e $old_path/$data_relative && ! -L $old_path/$data_relative && -d $NEXTCLOUD_PATH/$data_relative && ! -L $NEXTCLOUD_PATH/$data_relative ]] || return 1
+    mv -T -- "$NEXTCLOUD_PATH/$data_relative" "$old_path/$data_relative" || return 1
 }
 
 # PHP is already required by Nextcloud; use it for structured data, not regex XML.
@@ -126,6 +214,9 @@ if ($mode === 'build') {
         if (!str_starts_with($p, $argv[2] . '/') || !preg_match('~^[A-Za-z0-9_-]+$~D', substr($p, strlen($argv[2]) + 1))) bad('Unsupported external or nested apps path; preserve it explicitly before upgrading');
         echo substr($p, strlen($argv[2]) + 1) . "\n";
     }
+} elseif ($mode === 'local-data') {
+    $s = json_decode(stream_get_contents(STDIN), true, 512, JSON_THROW_ON_ERROR)['system'];
+    if (!empty($s['objectstore']) || !empty($s['objectstore_multibucket'])) bad('BACKUP_DATA only backs up a filesystem data directory, not primary object storage');
 }
 PHP
 )" "$@"
@@ -139,7 +230,7 @@ set_phase() {
         # Persist recovery boundaries before filesystem changes or migration.
         sync -f "$recovery"
     fi
-    log "$2"
+    log "${3:---info}" "$2"
 }
 
 # Keep backend selection out of the upgrade and recovery lifecycle.
@@ -175,7 +266,7 @@ wait_service() {
         [[ $state == "$expected" ]] && return 0
         ((i == WAIT_AFTER_SERVER_START)) || sleep 1
     done
-    log "Service $service did not reach $expected (last state: $state)" >&2
+    log --error "Service $service did not reach $expected (last state: $state)" >&2
     return 1
 }
 stop_services() {
@@ -203,7 +294,7 @@ restore_cron() {
         return 0
     fi
     cmp -s "$recovery/cron.disabled" "$recovery/cron.current" || {
-        log 'Crontab changed externally; reconcile cron.original and cron.current manually.' >&2
+        log --warning 'Crontab changed externally; reconcile cron.original and cron.current manually.' >&2
         return 1
     }
     crontab -u www-data "$recovery/cron.original" || return 1
@@ -216,7 +307,7 @@ on_exit() {
     set +e
     [[ -z $credentials ]] || rm -f -- "$credentials"
     if [[ $rc != 0 ]]; then
-        log "FAILED (exit $rc). No successful upgrade is being reported." >&2
+        log --error "FAILED (exit $rc). No successful upgrade is being reported." >&2
         if [[ $production_changed == yes ]]; then
             # Re-establish the marker even if the final marker removal/sync failed.
             printf '%s\n' "$recovery" > "$BACKUP_PATH/upgrade-active"
@@ -228,27 +319,32 @@ on_exit() {
                 # if it is still exactly one of our known snapshots.
                 if crontab -u www-data -l > "$recovery/cron.current"; then
                     if cmp -s "$recovery/cron.original" "$recovery/cron.current"; then
-                        crontab -u www-data "$recovery/cron.disabled" || log 'Disable Nextcloud cron manually now.' >&2
+                        crontab -u www-data "$recovery/cron.disabled" || log --error 'Disable Nextcloud cron manually now.' >&2
                     elif ! cmp -s "$recovery/cron.disabled" "$recovery/cron.current"; then
-                        log 'Crontab changed externally; disable Nextcloud cron manually now.' >&2
+                        log --warning 'Crontab changed externally; disable Nextcloud cron manually now.' >&2
                     fi
                 else
-                    log 'Cannot inspect crontab; disable Nextcloud cron manually now.' >&2
+                    log --error 'Cannot inspect crontab; disable Nextcloud cron manually now.' >&2
                 fi
                 # Code alone cannot undo a database migration. Keep every artifact.
                 occ maintenance:mode --on >/dev/null 2>&1
-                stop_services || log 'Could not confirm services stopped; block access manually now.' >&2
-                log 'Database migration may have changed state. Keep cron disabled; see README.md (Backups and troubleshooting) for manual recovery.' >&2
+                stop_services || log --error 'Could not confirm services stopped; block access manually now.' >&2
+                log --warning 'Database migration may have changed state. Keep cron disabled; see README.md (Backups and troubleshooting) for manual recovery.' >&2
                 safe=no
             else
                 stop_services || safe=no
                 if [[ $safe == yes && $replacement_started == yes && -d $old_path ]]; then
-                    if [[ -e $NEXTCLOUD_PATH ]]; then
+                    restore_internal_data || safe=no
+                    if [[ $safe == yes && -e $NEXTCLOUD_PATH ]]; then
                         mv -T -- "$NEXTCLOUD_PATH" "$stage/failed-release" || safe=no
                     fi
                     if [[ $safe == yes ]]; then
                         mv -T -- "$old_path" "$NEXTCLOUD_PATH" || safe=no
                     fi
+                fi
+                if [[ $safe == yes ]]; then
+                    [[ -d $data_path && $(stat -c '%d:%i' "$data_path") == "$data_identity" ]] || safe=no
+                    [[ $(realpath -e -- "$(config datadirectory)") == "$data_path" ]] || safe=no
                 fi
                 if [[ $safe == yes ]]; then
                     occ status --output=json | php_info status any "$current_release" >/dev/null || safe=no
@@ -266,11 +362,11 @@ on_exit() {
                     printf 'recovered-before-migration\n' > "$recovery/phase"
                     sync -f "$recovery"
                     rm -f -- "$BACKUP_PATH/upgrade-active"
-                    log 'Original application restored; no database migration was started.' >&2
+                    log --success 'Original application restored; no database migration was started.' >&2
                 else
                     occ maintenance:mode --on >/dev/null 2>&1
-                    stop_services || log 'Block access manually; service shutdown could not be verified.' >&2
-                    log 'Automatic recovery incomplete. Keep access blocked and see README.md (Backups and troubleshooting).' >&2
+                    stop_services || log --error 'Block access manually; service shutdown could not be verified.' >&2
+                    log --error 'Automatic recovery incomplete. Keep access blocked and see README.md (Backups and troubleshooting).' >&2
                 fi
             fi
         fi
@@ -284,13 +380,15 @@ on_exit() {
 }
 trap on_exit EXIT
 # Never log BASH_COMMAND: it could contain credentials.
-trap 'rc=$?; log "Operation failed at script line $LINENO (exit $rc)." >&2; exit "$rc"' ERR
+trap 'rc=$?; log --error "Operation failed at script line $LINENO (exit $rc)." >&2; exit "$rc"' ERR
 trap 'exit 130' INT
 trap 'exit 143' TERM
 trap 'exit 129' HUP
 
 [[ $EUID == 0 ]] || fail 'Run as root.'
 [[ $# -le 1 ]] || fail 'Usage: nextcloud-upgrade.sh [stable-version]'
+case $BACKUP_DATA in yes) need rsync;; no) ;; *) fail 'BACKUP_DATA must be yes or no.';; esac
+case $BACKUP_ARCHIVE in yes) need tar; need sha256sum;; no) ;; *) fail 'BACKUP_ARCHIVE must be yes or no.';; esac
 case $SERVICE_MANAGER in
     monit) need monit ;;
     systemd) ;;
@@ -305,7 +403,7 @@ WAIT_BEFORE_BACKUP=$((10#$WAIT_BEFORE_BACKUP))
 WAIT_AFTER_SERVER_START=$((10#$WAIT_AFTER_SERVER_START))
 case $DOWNLOAD_FORMAT in tar.bz2) need tar; need bzip2;; zip) need unzip; need zipinfo;; *) fail 'DOWNLOAD_FORMAT must be tar.bz2 or zip.';; esac
 case $CHECKSUM_TYPE in sha256|sha512|md5) need "${CHECKSUM_TYPE}sum";; *) fail 'Unsupported CHECKSUM_TYPE.';; esac
-[[ $CHECKSUM_TYPE != md5 ]] || log 'Warning: MD5 only detects accidental corruption; prefer SHA256.'
+[[ $CHECKSUM_TYPE != md5 ]] || log --warning 'Warning: MD5 only detects accidental corruption; prefer SHA256.'
 exec 9>/run/lock/nextcloud-upgrade.lock
 flock -n 9 || fail 'Another upgrade is already running.'
 [[ ! -e $BACKUP_PATH/upgrade-active ]] || fail "Interrupted attempt recorded in $BACKUP_PATH/upgrade-active; see README.md (Backups and troubleshooting) before retrying."
@@ -320,11 +418,17 @@ backup_mode=$(stat -c %a "$BACKUP_PATH")
 (( (8#$backup_mode & 0022) == 0 )) || fail 'Backup directory must not be writable by group or others.'
 [[ ! -e ${NEXTCLOUD_PATH}.old ]] || fail 'Legacy .old directory exists; identify and preserve its recovery state before proceeding.'
 [[ -f $NEXTCLOUD_PATH/occ && -f $NEXTCLOUD_PATH/config/config.php ]] || fail 'Nextcloud files are missing.'
-# Never traverse an application mount or symlink into EFS during copying/ownership.
-check_application_tree
 data_path=$(realpath -e -- "$(config datadirectory)")
-[[ $data_path != "$NEXTCLOUD_PATH" && $data_path != "$NEXTCLOUD_PATH/"* && $NEXTCLOUD_PATH != "$data_path/"* ]] || fail 'Only an external data directory is supported; no user data will be copied.'
+[[ -d $data_path && $data_path != / && $data_path != *[[:cntrl:]]* ]] || fail 'Configured data directory must be an existing directory other than /.'
+[[ $data_path != "$NEXTCLOUD_PATH" && $NEXTCLOUD_PATH != "$data_path/"* ]] || fail 'Data directory must not contain the application.'
+data_identity=$(stat -c '%d:%i' "$data_path")
 [[ $BACKUP_PATH != "$data_path" && $BACKUP_PATH != "$data_path/"* ]] || fail 'Recovery backups must be outside the user-data directory.'
+if [[ $data_path == "$NEXTCLOUD_PATH/"* ]]; then
+    data_relative=${data_path#"$NEXTCLOUD_PATH/"}
+    [[ $data_relative != config && $data_relative != config/* ]] || fail 'Data directory must be separate from configuration.'
+fi
+# Internal data is pruned from application inspection and ownership operations.
+check_application_tree
 current_version=$(occ status --output=json | php_info status off)
 [[ $current_version =~ ^[0-9]+\.[0-9]+\.[0-9]+(\.[0-9]+)?$ ]] || fail 'Invalid installed version.'
 check_services
@@ -339,14 +443,14 @@ if [[ $# == 0 ]]; then
     curl --fail --silent --show-error --location --proto '=https' --proto-redir '=https' --connect-timeout 15 --max-time 60 --retry 2 \
         -H 'User-Agent: Nextcloud Updater' "https://updates.nextcloud.com/updater_server/?version=${current_version//./x}xxxstablexx${build}" > "$workspace/update.xml"
     new_version=$(php_info update < "$workspace/update.xml")
-    [[ -n $new_version ]] || { log 'No stable update is available.'; exit 0; }
+    [[ -n $new_version ]] || { log --success 'No stable update is available.'; exit 0; }
 else
     new_version=$1
 fi
 [[ $new_version =~ ^[0-9]+\.[0-9]+\.[0-9]+(\.[0-9]+)?$ ]] || fail 'Target must be a numeric stable release.'
 download_version=$(awk -F. '{print $1"."$2"."$3}' <<< "$new_version")
 current_release=$(awk -F. '{print $1"."$2"."$3}' <<< "$current_version")
-[[ $download_version != "$current_release" ]] || { log 'Already on the requested release.'; exit 0; }
+[[ $download_version != "$current_release" ]] || { log --success 'Already on the requested release.'; exit 0; }
 [[ $(printf '%s\n%s\n' "$current_release" "$download_version" | sort -V | head -n1) == "$current_release" ]] || fail 'Downgrades are not supported.'
 current_major=${current_release%%.*}; target_major=${download_version%%.*}
 ((10#$target_major <= 10#$current_major + 1)) || fail 'Cannot skip major versions.'
@@ -364,6 +468,7 @@ done
 expected=$(awk -v name="$archive_name" '$2 == name || $2 == "*"name { print $1 }' "$workspace/$archive_name.$CHECKSUM_TYPE")
 actual=$("${CHECKSUM_TYPE}sum" "$workspace/$archive_name"); actual=${actual%% *}
 [[ $expected == "$actual" ]] || fail 'Archive checksum failed or checksum entry is ambiguous.'
+log --success 'Downloaded archive checksum verified.'
 
 check_space() {
     local path=$1 bytes=$2 inodes=$3 available free_inodes
@@ -397,13 +502,23 @@ for file in occ version.php index.php status.php lib/versioncheck.php; do [[ -f 
 release_links=$(find "$release" -type l -print -quit)
 [[ -z $release_links ]] || fail 'Release contains symlinks.'
 php_info release "$release" "$download_version"
+log --success 'Stable release and PHP compatibility checked.'
 # Stage on the installation filesystem so both replacements are renames, not copies.
 parent=$(dirname -- "$NEXTCLOUD_PATH")
-app_bytes=$(du -sb "$NEXTCLOUD_PATH" | awk '{print $1}')
-app_inodes=$(find "$NEXTCLOUD_PATH" -printf '.\n' | wc -l)
+app_bytes=$(find_application -printf '%s\n' | awk '{bytes+=$1} END {printf "%.0f\n",bytes}')
+app_inodes=$(find_application -printf '.\n' | wc -l)
 check_space "$parent" "$((unpacked_bytes + app_bytes + 104857600))" "$((entry_count + app_inodes + 1000))"
 stage=$(mktemp -d -p "$parent" .nextcloud-stage.XXXXXXXX)
 cp -a -- "$release" "$stage/nextcloud"
+if [[ -n $data_relative ]]; then
+    # Some archives contain the standard data/ skeleton. It is not live data.
+    if [[ $data_relative == data && -d $stage/nextcloud/data ]]; then
+        rm -rf -- "$stage/nextcloud/data"
+    fi
+    [[ ! -e $stage/nextcloud/$data_relative ]] || fail 'Internal data directory conflicts with new release content.'
+    data_parent=$(dirname -- "$stage/nextcloud/$data_relative")
+    mkdir -p -- "$data_parent"
+fi
 occ config:list system --output=json | php_info apps "$NEXTCLOUD_PATH" > "$workspace/extra-app-paths"
 check_custom_apps
 
@@ -438,6 +553,11 @@ fi
 for path in "${preserved_paths[@]}"; do
     printf '%s\n' "$path" >> "$workspace/preserved-paths"
     log "Preserving: $path"
+done
+preserve_bytes=0
+for path in config "${preserved_paths[@]}"; do
+    bytes=$(du -sb -- "$NEXTCLOUD_PATH/$path" | awk '{print $1}')
+    preserve_bytes=$((preserve_bytes + bytes))
 done
 
 # Prepare credentials privately, retaining neither password nor credential file in logs.
@@ -476,8 +596,47 @@ else
     fail "Unsupported database type: $db_type"
 fi
 [[ $db_bytes =~ ^[0-9]+$ ]] || fail 'Cannot estimate database backup size.'
+if [[ -n $BACKUP_SSH_DEST ]]; then
+    need ssh; need tar
+    [[ $BACKUP_SSH_DEST =~ ^([A-Za-z0-9_][A-Za-z0-9_.@-]*):(/.*)$ && $BACKUP_SSH_DEST != *[[:cntrl:]]* ]] || fail 'BACKUP_SSH_DEST must be [user@]host:/absolute/directory; use an SSH host alias for custom ports or IPv6.'
+    ssh_host=${BASH_REMATCH[1]}; ssh_directory=${BASH_REMATCH[2]%/}
+    [[ -n $ssh_directory ]] || fail 'Use a dedicated remote backup directory, not /.'
+    quoted_directory=$(shell_quote "$ssh_directory")
+    backup_ssh "command -v tar > /dev/null && command -v sync > /dev/null && test -d $quoted_directory && test -w $quoted_directory" || fail 'Cannot access SSH backup destination; check root SSH access, known_hosts and directory permissions.'
+    log "Off-site recovery backup enabled: $BACKUP_SSH_DEST"
+fi
 # SQL can be larger than table storage; reserve raw + compressed dump headroom.
-check_space "$BACKUP_PATH" "$((db_bytes * 5 + app_bytes + 104857600))" "$((app_inodes + 1000))"
+check_backup_space() {
+    local bytes=$((db_bytes * 5 + preserve_bytes + data_bytes + 104857600))
+    local inodes=$((app_inodes + data_inodes + 1000))
+    # Packaging keeps the directory copy too; allow tar headers/ACLs per entry.
+    if [[ $BACKUP_ARCHIVE == yes ]]; then bytes=$((bytes * 2 + inodes * 4096)); fi
+    # The pending config/custom copies into staging also need room on a shared FS.
+    if [[ $(stat -c %d "$BACKUP_PATH") == "$(stat -c %d "$stage")" ]]; then
+        bytes=$((bytes + preserve_bytes)); inodes=$((inodes + app_inodes))
+    fi
+    check_space "$BACKUP_PATH" "$bytes" "$inodes"
+}
+data_bytes=0 data_inodes=0
+if [[ $BACKUP_DATA == yes ]]; then
+    occ config:list system --output=json | php_info local-data
+    data_bytes=$(du -sb "$data_path" | awk '{print $1}')
+    data_inodes=$(find "$data_path" -printf '.\n' | wc -l)
+    [[ $data_bytes =~ ^[0-9]+$ && $data_inodes =~ ^[0-9]+$ ]] || fail 'Cannot estimate data backup size.'
+    log "Data backup enabled: $data_path -> $BACKUP_PATH (estimated $data_bytes bytes)."
+else
+    log 'Data backup disabled for this run.'
+    # Best-effort advice only: a filesystem type cannot reveal backup coverage.
+    data_fstype=$(findmnt --noheadings --raw --target "$data_path" --output FSTYPE 2>/dev/null || true)
+    case $data_fstype in
+        ext[234]|xfs|btrfs|zfs|f2fs|bcachefs|tmpfs|ramfs|overlay|aufs|fuseblk)
+            log --warning 'Note: data appears to be on local storage. Consider a separate data backup if your existing backup system does not cover it.' ;;
+    esac
+fi
+if [[ -z $BACKUP_SSH_DEST && $(stat -c %d "$BACKUP_PATH") == "$(stat -c %d "$data_path")" ]]; then
+    log --warning 'Note: recovery backups share the data filesystem. Consider an off-server copy if you do not already keep one.'
+fi
+check_backup_space
 crontab -u www-data -l > "$workspace/cron.original" || fail 'Cannot read www-data crontab; configure or inspect it before upgrading.'
 # Match this installation only. Reject an unrecognised cron.php invocation.
 awk -v target="$NEXTCLOUD_PATH/cron.php" '
@@ -489,8 +648,9 @@ awk -v target="$NEXTCLOUD_PATH/cron.php" '
     }
     {print}
 ' "$workspace/cron.original" > "$workspace/cron.disabled" || fail 'Unrecognised cron.php invocation; inspect the crontab first.'
-log "Ready: $current_version -> $download_version. Database and config backup will follow quiescence."
-read -r -p 'Proceed with the upgrade? [y/N]: ' answer
+log --success "Ready: $current_version -> $download_version. Database and config backup will follow quiescence."
+log --question 'Proceed with the upgrade? [y/N]:'
+read -r answer
 [[ $answer == y || $answer == Y ]] || { log 'Upgrade cancelled.'; exit 0; }
 
 recovery=$(mktemp -d -p "$BACKUP_PATH" "upgrade-$(date -u +%Y%m%dT%H%M%SZ).XXXXXXXX")
@@ -499,6 +659,8 @@ cp -- "$workspace/cron.original" "$workspace/cron.disabled" "$recovery/"
 cp -- "$workspace/preserved-paths" "$recovery/preserved-paths"
 printf 'installation=%s\nprevious_version=%s\ntarget_version=%s\nold_application=%s\nstaging=%s\nworkspace=%s\ndatabase_type=%s\ndatabase_name=%s\nservice_manager=%s\nweb_service=%s\nphp_service=%s\n' \
     "$NEXTCLOUD_PATH" "$current_version" "$download_version" "$old_path" "$stage" "$workspace" "$db_type" "$db_name" "$SERVICE_MANAGER" "$WEB_SERVICE" "$PHP_SERVICE" > "$recovery/manifest"
+printf 'data_directory=%s\ndata_identity=%s\ninternal_data_relative=%s\nbackup_data=%s\n' "$data_path" "$data_identity" "$data_relative" "$BACKUP_DATA" >> "$recovery/manifest"
+printf 'backup_archive=%s\nbackup_ssh_destination=%s\n' "$BACKUP_ARCHIVE" "$BACKUP_SSH_DEST" >> "$recovery/manifest"
 set_phase quiescing "Enabling maintenance, disabling Nextcloud cron, and stopping application services through $SERVICE_MANAGER."
 printf '%s\n' "$recovery" > "$BACKUP_PATH/upgrade-active"
 sync -f "$BACKUP_PATH"
@@ -524,6 +686,12 @@ done
 check_application_tree
 check_custom_apps
 for path in "${preserved_paths[@]}"; do check_preserved_path "$path"; done
+[[ $(realpath -e -- "$(config datadirectory)") == "$data_path" && -d $data_path && $(stat -c '%d:%i' "$data_path") == "$data_identity" ]] || fail 'Configured data directory or its mount changed during preparation.'
+if [[ $BACKUP_DATA == yes ]]; then
+    data_bytes=$(du -sb "$data_path" | awk '{print $1}')
+    data_inodes=$(find "$data_path" -printf '.\n' | wc -l)
+    check_backup_space
+fi
 set_phase backup 'Creating and validating recovery backups.'
 if [[ $db_type == mysql ]]; then
     "$dump_cmd" --defaults-file="$credentials" --single-transaction --quick --default-character-set=utf8mb4 --comments --dump-date "$db_name" > "$recovery/database.sql.part"
@@ -540,6 +708,14 @@ rm -- "$recovery/database.sql.part"
 [[ -z $credentials ]] || rm -f -- "$credentials"
 credentials=; unset db_password
 cp -a -- "$NEXTCLOUD_PATH/config" "$recovery/config"
+for path in "${preserved_paths[@]}"; do
+    mkdir -p -- "$(dirname -- "$recovery/custom/$path")"
+    cp -aT -- "$NEXTCLOUD_PATH/$path" "$recovery/custom/$path"
+done
+if [[ $BACKUP_DATA == yes ]]; then backup_data; fi
+set_phase backups-ready 'Recovery backups are ready; application replacement has not started.' --success
+if [[ $BACKUP_ARCHIVE == yes ]]; then package_backups; fi
+if [[ -n $BACKUP_SSH_DEST ]]; then copy_backups_offsite; fi
 # Keep all config fragments and known installation-specific application components.
 rm -rf -- "$stage/nextcloud/config"
 cp -a -- "$NEXTCLOUD_PATH/config" "$stage/nextcloud/config"
@@ -560,6 +736,9 @@ set_phase replacing 'Replacing application with same-filesystem renames.'
 replacement_started=yes
 mv -T -- "$NEXTCLOUD_PATH" "$old_path"
 mv -T -- "$stage/nextcloud" "$NEXTCLOUD_PATH"
+if [[ -n $data_relative ]]; then
+    mv -T -- "$old_path/$data_relative" "$NEXTCLOUD_PATH/$data_relative"
+fi
 sync -f "$parent"
 set_phase migration-started 'Starting database migration; automatic application rollback ends here.'
 migration_started=yes
@@ -575,7 +754,7 @@ restore_cron
 occ maintenance:mode --off
 occ status --output=json | php_info status off "$download_version" > "$recovery/status.version"
 # Services were already verified active. A browser/client check remains mandatory.
-set_phase complete 'Local upgrade checks passed. Verify the web interface and a client before removing recovery artifacts.'
+set_phase complete 'Local upgrade checks passed. Verify the web interface and a client before removing recovery artifacts.' --success
 rm -- "$BACKUP_PATH/upgrade-active"
 sync -f "$BACKUP_PATH"
 finished=yes

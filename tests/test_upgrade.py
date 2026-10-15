@@ -21,7 +21,7 @@ import zipfile
 
 SCRIPT = Path(__file__).resolve().parents[1] / 'nextcloud-upgrade.sh'
 REAL_PHP = shutil.which(os.environ.get('TEST_PHP', 'php'))
-REAL_TOOLS = {name: shutil.which(name) for name in ('stat', 'mv', 'cp', 'tar', 'gzip', 'df')}
+REAL_TOOLS = {name: shutil.which(name) for name in ('stat', 'mv', 'cp', 'tar', 'gzip', 'df', 'rsync')}
 
 MOCK = r'''#!/usr/bin/env python3
 import json, os, pathlib, signal, subprocess, sys, time
@@ -50,14 +50,17 @@ if name == 'sudo':
         if mode == 'postcheck' and s['version'] != '34.0.0.0': die(24)
         print(json.dumps(s))
     elif a[0] == 'config:system:get':
-        values = {'version': '34.0.0.0', 'datadirectory': str(root / 'storage'),
+        values = {'version': '34.0.0.0', 'datadirectory': os.environ.get('DATA_DIRECTORY', str(root / 'storage')),
                   'dbtype': os.environ.get('DB_TYPE', 'mysql'), 'dbname': 'nextcloud',
                   'dbuser': 'nc', 'dbpassword': 'secret#"\\value',
                   'dbhost': os.environ.get('DB_HOST', 'localhost'), 'updater.release.channel': 'stable'}
         if a[1] not in values: die(1)
         print(values[a[1]])
     elif a[0] == 'config:list':
-        print(json.dumps({'system': {'apps_paths': [{'path': str(root / 'nextcloud/apps')}, {'path': str(root / 'nextcloud/custom_apps')}]}}))
+        extra_paths = json.loads(os.environ.get('EXTRA_APPS_PATHS', '["custom_apps"]'))
+        system = {'apps_paths': [{'path': str(root / 'nextcloud/apps')}, *[{'path': str(root / 'nextcloud' / p)} for p in extra_paths]]}
+        if mode == 'objectstore': system['objectstore'] = {'class': 'S3'}
+        print(json.dumps({'system': system}))
     elif a[0] == 'maintenance:mode':
         if a[1] == '--on': fail_once('maintenance-on')
         if a[1] == '--off': fail_once('maintenance-off')
@@ -65,6 +68,8 @@ if name == 'sudo':
     elif a[0] == 'upgrade':
         assert all(state == 'inactive' for state in load('services').values())
         assert '# nextcloud-upgrade:' in (root / 'cron').read_text()
+        if os.environ.get('DATA_DIRECTORY'):
+            assert (pathlib.Path(os.environ['DATA_DIRECTORY']) / 'sentinel').read_text() == 'Never modify or duplicate EFS data'
         s['version'] = '34.0.1.0'
         if mode in ('migration', 'signal-migration', 'hup-migration', 'kill-migration'):
             s['needsDbUpgrade'] = True
@@ -125,6 +130,9 @@ elif name == 'monit' or (name == 'systemctl' and args[0] in ('start', 'stop')):
             custom.unlink(); custom.symlink_to(root / 'storage/sentinel')
         if mode == 'custom-mount': (root / 'mounted').touch()
         if mode == 'custom-app-conflict': (root / 'nextcloud/custom_apps/core').mkdir()
+        if mode == 'data-replaced':
+            data = pathlib.Path(os.environ.get('DATA_DIRECTORY', str(root / 'storage')))
+            data.rename(data.with_name('original-data')); data.mkdir()
     state = load('services')
     expected = 'active' if action == 'start' else 'inactive'
     state[svc] = expected
@@ -186,22 +194,40 @@ elif name in ('mariadb-dump', 'mysqldump', 'pg_dump'):
     if name == 'pg_dump': pathlib.Path(next(a.split('=', 1)[1] for a in args if a.startswith('--file='))).write_text(dump)
     else: sys.stdout.write(dump)
 elif name == 'findmnt':
+    if args[-2:] == ['--output', 'FSTYPE']:
+        if mode == 'fstype-unavailable': die(1)
+        print(os.environ.get('DATA_FSTYPE', 'ext4')); die(0)
     print('/')
     if mode == 'mount': print(str(root / 'nextcloud/data'))
     if (root / 'mounted').exists(): print(str(root / 'nextcloud/local.txt'))
+    if mode == 'data-mount': print(os.environ['DATA_DIRECTORY'].replace(' ', r'\x20'))
 elif name == 'pgrep':
     if mode == 'background': print('1234'); die(0)
     die(1)
 elif name == 'chown':
     assert str(root / '.nextcloud-stage.') in args[-1], args
+    assert not (pathlib.Path(args[-1]) / 'data/sentinel').exists(), 'Live data must not be present during ownership changes'
 elif name == 'stat':
     if args[:2] == ['-c', '%u']: print('0')
     else: os.execv(os.environ['REAL_STAT'], [os.environ['REAL_STAT'], *args])
 elif name == 'df':
     if mode == 'space': print('Filesystem 1-blocks Used Available Capacity Mounted on\nfixture 1 1 0 100% /')
     elif mode == 'inodes' and '-Pi' in args: print('Filesystem Inodes IUsed IFree IUse% Mounted on\nfixture 1 1 0 100% /')
+    elif mode == 'data-space' and '-PB1' in args and args[-1] == str(root / 'backups'):
+        print('Filesystem 1-blocks Used Available Capacity Mounted on\nfixture 999999999 1 105000000 1% /')
     else: os.execv(os.environ['REAL_DF'], [os.environ['REAL_DF'], *args])
 elif name == 'mv':
+    if args[-2].endswith('/data.partial'): fail_once('data-backup-rename')
+    data = os.environ.get('DATA_DIRECTORY', str(root / 'storage'))
+    if 'nextcloud.old.' in args[-2] and args[-1] == data:
+        event('data move')
+        fail_once('data-move')
+        if mode in ('after-data-move', 'data-rollback', 'signal-after-data-move', 'kill-after-data-move'):
+            subprocess.run([os.environ['REAL_MV'], *args], check=True)
+            if mode == 'signal-after-data-move': os.kill(int(os.environ['UPGRADE_PID']), signal.SIGTERM); time.sleep(.2); die(143)
+            if mode == 'kill-after-data-move': os.kill(int(os.environ['UPGRADE_PID']), signal.SIGKILL); die(137)
+            die(28)
+    if mode == 'data-rollback' and args[-2] == data and 'nextcloud.old.' in args[-1]: die(29)
     if args[-2] == str(root / 'nextcloud'): fail_once('old-rename')
     if mode == 'rollback-rename' and 'nextcloud.old.' in args[-2] and args[-1] == str(root / 'nextcloud'): die(29)
     if '.nextcloud-stage.' in args[-2] and args[-2].endswith('/nextcloud'):
@@ -215,10 +241,43 @@ elif name == 'cp':
     os.execv(os.environ['REAL_CP'], [os.environ['REAL_CP'], *args])
 elif name == 'tar':
     if '-xjf' in args: fail_once('extract')
+    if '-cf' in args: fail_once('archive-create')
+    if '-tf' in args and args[-1].endswith('/backup.tar.partial'): fail_once('archive-check')
     os.execv(os.environ['REAL_TAR'], [os.environ['REAL_TAR'], *args])
 elif name == 'gzip':
     if '-c' in args: fail_once('compress')
     os.execv(os.environ['REAL_GZIP'], [os.environ['REAL_GZIP'], *args])
+elif name == 'rsync':
+    event('data verify' if '-aHAXnc' in args else 'data copy')
+    assert load('status')['maintenance']
+    assert all(state == 'inactive' for state in load('services').values())
+    assert '# nextcloud-upgrade:' in (root / 'cron').read_text()
+    assert pathlib.Path(args[-2]) == pathlib.Path(os.environ.get('DATA_DIRECTORY', str(root / 'storage')))
+    assert '/backups/upgrade-' in args[-1] and args[-1].endswith('/data.partial/'), args
+    if '-aHAXnc' in args:
+        assert '--delete' in args and '--itemize-changes' in args
+        if mode == 'data-verify': print('>fc........ sentinel'); die(0)
+        fail_once('data-verify-error')
+    else:
+        (pathlib.Path(args[-1]) / 'partial-file').write_text('partial') if mode == 'data-copy' else None
+        fail_once('data-copy')
+        if mode == 'signal-data-copy': os.kill(int(os.environ['UPGRADE_PID']), signal.SIGTERM); time.sleep(.2); die(143)
+    os.execv(os.environ['REAL_RSYNC'], [os.environ['REAL_RSYNC'], *args])
+elif name == 'ssh':
+    assert args[:3] == ['-T', '-o', 'BatchMode=yes'], args
+    assert 'StrictHostKeyChecking=yes' in args
+    assert args[-2] == 'backup@backup-host', args
+    command = args[-1]
+    assert str(root / 'remote') in command, command
+    assert str(root / 'nextcloud') not in command, command
+    if command.startswith('command -v'):
+        event('ssh check'); fail_once('ssh-connect')
+    else:
+        event('ssh copy')
+        assert load('status')['maintenance']
+        assert all(state == 'inactive' for state in load('services').values())
+        fail_once('ssh-copy')
+    die(subprocess.run(['/bin/sh', '-c', command], cwd=root).returncode)
 else: raise AssertionError(name)
 '''
 
@@ -233,7 +292,7 @@ class UpgradeScenarios:
         (r / 'bin').mkdir()
         mock = r / 'bin/mock'; mock.write_text(MOCK.replace('#!/usr/bin/env python3', '#!' + sys.executable, 1)); mock.chmod(0o755)
         names = ('sudo php curl monit systemctl crontab mariadb mariadb-dump mysql mysqldump psql pg_dump '
-                 'findmnt pgrep chown stat df mv cp tar gzip').split()
+                 'findmnt pgrep chown stat df mv cp tar gzip rsync ssh').split()
         for name in names: (r / 'bin' / name).symlink_to(mock)
         # A closed PATH prevents missing doubles from reaching real host tools.
         tools = ('bash cat mktemp flock realpath find du awk grep sort head tail wc dirname date cmp rm '
@@ -281,7 +340,8 @@ class UpgradeScenarios:
                         SERVICE_MANAGER=self.service_manager,
                         NEXTCLOUD_PATH=str(r / 'nextcloud'), BACKUP_PATH=str(r / 'backups'),
                         WAIT_BEFORE_BACKUP='0', WAIT_AFTER_SERVER_START='0')
-        for name, tool in REAL_TOOLS.items(): self.env['REAL_' + name.upper()] = tool
+        for name, tool in REAL_TOOLS.items():
+            if tool: self.env['REAL_' + name.upper()] = tool
 
     @property
     def service_command(self):
@@ -706,6 +766,249 @@ class MonitUpgradeTests(UpgradeScenarios, unittest.TestCase):
 
 class SystemdUpgradeTests(UpgradeScenarios, unittest.TestCase):
     service_manager = 'systemd'
+
+@unittest.skipUnless(REAL_PHP and REAL_TOOLS['rsync'], 'PHP with SimpleXML and rsync required')
+class DataBackupTests(unittest.TestCase):
+    def fixture(self, manager='systemd', relative=None):
+        cls = MonitUpgradeTests if manager == 'monit' else SystemdUpgradeTests
+        fixture = cls('test_success_preserves_config_apps_themes_schedule_and_recovery')
+        fixture.setUp(); self.addCleanup(fixture.doCleanups)
+        data = fixture.root / 'storage'
+        if relative:
+            destination = fixture.root / 'nextcloud' / relative
+            destination.parent.mkdir(parents=True, exist_ok=True)
+            data.rename(destination); data = destination
+            fixture.env['DATA_DIRECTORY'] = str(data)
+        fixture.data = data
+        (data / '.ocdata').write_text('data marker')
+        (data / 'sentinel').chmod(0o604)
+        try: os.setxattr(data / 'sentinel', 'user.backup-test', b'preserve attributes')
+        except OSError: pass  # Filesystems without user xattrs can still run other cases.
+        (data / 'users').mkdir()
+        (data / 'users/.hidden').write_text('private content')
+        (data / 'link').symlink_to('/does/not/exist')
+        return fixture
+
+    def assert_data_untouched(self, fixture):
+        self.assertEqual((fixture.data / 'sentinel').read_text(), 'Never modify or duplicate EFS data')
+        self.assertEqual((fixture.data / 'sentinel').stat().st_mode & 0o777, 0o604)
+        self.assertEqual(os.readlink(fixture.data / 'link'), '/does/not/exist')
+        self.assertEqual((fixture.data / 'users/.hidden').read_text(), 'private content')
+
+    def assert_recovered(self, fixture):
+        self.assertEqual((fixture.root / 'nextcloud/occ').read_text(), 'old-code', fixture.output)
+        self.assertFalse(json.loads((fixture.root / 'status').read_text())['maintenance'], fixture.output)
+        self.assertEqual(json.loads((fixture.root / 'services').read_text()), {'nginx': 'active', 'php8.4-fpm': 'active'})
+        self.assertEqual((fixture.root / 'cron').read_text(), fixture.original_cron)
+        self.assertFalse((fixture.root / 'backups/upgrade-active').exists(), fixture.output)
+        self.assertNotIn('occ upgrade', (fixture.root / 'events').read_text())
+        self.assert_data_untouched(fixture)
+
+    def test_internal_and_external_data_with_backup_on_and_off(self):
+        for manager in ('monit', 'systemd'):
+            for relative in (None, 'data', 'private/user files'):
+                for enabled in ('no', 'yes'):
+                    with self.subTest(manager=manager, relative=relative, enabled=enabled):
+                        f = self.fixture(manager, relative)
+                        if relative == 'data':
+                            skeleton = f.root / 'release/nextcloud/data'
+                            skeleton.mkdir(); (skeleton / '.htaccess').write_text('new skeleton')
+                            f.make_archive()
+                        self.assertEqual(f.run_upgrade(extra={'BACKUP_DATA': enabled}).returncode, 0, f.output)
+                        self.assert_data_untouched(f)
+                        recovery = next((f.root / 'backups').glob('upgrade-*'))
+                        self.assertEqual((recovery / 'data').exists(), enabled == 'yes')
+                        self.assertFalse((recovery / 'data.partial').exists())
+                        manifest = (recovery / 'manifest').read_text()
+                        self.assertIn('data_directory=' + str(f.data), manifest)
+                        self.assertIn('backup_data=' + enabled, manifest)
+                        self.assertIn('internal_data_relative=' + (relative or ''), manifest)
+                        self.assertFalse((recovery / 'backup.tar').exists())
+                        events = (f.root / 'events').read_text()
+                        if enabled == 'yes':
+                            self.assertEqual((recovery / 'data/users/.hidden').read_text(), 'private content')
+                            self.assertEqual(os.readlink(recovery / 'data/link'), '/does/not/exist')
+                            self.assertEqual((recovery / 'data.verify.log').read_text(), '')
+                            self.assertLess(events.index('dump'), events.index('data copy'))
+                            self.assertLess(events.index('data verify'), events.index('occ upgrade'))
+                        else:
+                            self.assertNotIn('data copy', events)
+                        if relative:
+                            old = next(f.root.glob('nextcloud.old.*'))
+                            self.assertFalse((old / relative).exists())
+                            self.assertFalse(any((f.root / 'nextcloud').rglob('.nextcloud-stage.*')))
+
+    def test_disabled_data_backup_needs_no_rsync_and_local_backups_are_allowed(self):
+        f = self.fixture(relative='data'); (f.root / 'bin/rsync').unlink()
+        self.assertEqual(f.run_upgrade().returncode, 0, f.output)
+        self.assertIn('Note: recovery backups share the data filesystem', f.output)
+        self.assert_data_untouched(f)
+
+    def test_data_backup_failures_never_start_migration(self):
+        for mode in ('data-copy', 'data-verify', 'data-verify-error', 'data-backup-rename', 'signal-data-copy'):
+            with self.subTest(mode=mode):
+                f = self.fixture(relative='data')
+                self.assertNotEqual(f.run_upgrade(mode, extra={'BACKUP_DATA': 'yes'}).returncode, 0, f.output)
+                self.assert_recovered(f)
+                recovery = next((f.root / 'backups').glob('upgrade-*'))
+                self.assertTrue((recovery / 'database.sql.gz').exists())
+                self.assertTrue((recovery / 'data.partial').exists())
+                self.assertFalse((recovery / 'data').exists())
+
+    def test_internal_data_rename_failures_restore_data_and_code(self):
+        for manager in ('monit', 'systemd'):
+            for mode in ('old-rename', 'new-rename', 'data-move', 'after-data-move', 'signal-after-data-move'):
+                with self.subTest(manager=manager, mode=mode):
+                    f = self.fixture(manager, relative='data')
+                    self.assertNotEqual(f.run_upgrade(mode).returncode, 0, f.output)
+                    self.assert_recovered(f)
+
+    def test_failed_data_rollback_and_sigkill_keep_live_data_and_block_retry(self):
+        for mode in ('data-rollback', 'kill-after-data-move', 'migration'):
+            with self.subTest(mode=mode):
+                f = self.fixture(relative='data')
+                self.assertNotEqual(f.run_upgrade(mode).returncode, 0, f.output)
+                self.assertTrue((f.root / 'backups/upgrade-active').exists(), f.output)
+                self.assert_data_untouched(f)
+                self.assertNotEqual(f.run_upgrade().returncode, 0, f.output)
+                self.assertIn('Interrupted attempt', f.output)
+
+    def test_data_capacity_is_checked_only_when_copying_and_before_maintenance(self):
+        f = self.fixture(relative='data')
+        with (f.data / 'large').open('wb') as data: data.truncate(4 * 1024 * 1024)
+        self.assertEqual(f.run_upgrade('data-space', answer='n').returncode, 0, f.output)
+        self.assertNotEqual(f.run_upgrade('data-space', extra={'BACKUP_DATA': 'yes'}).returncode, 0, f.output)
+        self.assertIn('Insufficient space', f.output)
+        self.assertNotIn('occ maintenance:mode', (f.root / 'events').read_text())
+        self.assert_data_untouched(f)
+
+    def test_unsafe_data_layouts_and_primary_object_storage_are_rejected(self):
+        for name, extra, mode in [('missing', {'DATA_DIRECTORY': '/no-such-data'}, ''),
+                                  ('application', {'DATA_DIRECTORY': 'INSTALLATION'}, ''),
+                                  ('objectstore', {'BACKUP_DATA': 'yes'}, 'objectstore'),
+                                  ('invalid option', {'BACKUP_DATA': 'maybe'}, '')]:
+            with self.subTest(name=name):
+                f = self.fixture()
+                if extra.get('DATA_DIRECTORY') == 'INSTALLATION': extra['DATA_DIRECTORY'] = str(f.root / 'nextcloud')
+                self.assertNotEqual(f.run_upgrade(mode, extra=extra).returncode, 0, f.output)
+                self.assertNotIn('occ maintenance:mode', (f.root / 'events').read_text())
+                self.assert_data_untouched(f)
+        f = self.fixture()
+        inside = f.data / 'backups'; inside.mkdir(); inside.chmod(0o700)
+        self.assertNotEqual(f.run_upgrade(extra={'BACKUP_PATH': str(inside)}).returncode, 0, f.output)
+        self.assertIn('outside the user-data directory', f.output)
+
+    def test_custom_file_preservation_cannot_copy_internal_data_or_its_parent(self):
+        for path in ('private', 'private/user files', 'private/user files/sentinel'):
+            with self.subTest(path=path):
+                f = self.fixture(relative='private/user files')
+                self.assertNotEqual(f.run_upgrade(extra=f.preservation_list(path)).returncode, 0, f.output)
+                self.assertIn('User data is handled separately', f.output)
+                self.assertNotIn('occ maintenance:mode', (f.root / 'events').read_text())
+
+    def test_optional_archive_contains_restore_components_and_checksum(self):
+        for enabled in ('no', 'yes'):
+            with self.subTest(data=enabled):
+                f = self.fixture(relative='data')
+                self.assertEqual(f.run_upgrade(extra={'BACKUP_DATA': enabled, 'BACKUP_ARCHIVE': 'yes'}).returncode, 0, f.output)
+                recovery = next((f.root / 'backups').glob('upgrade-*'))
+                archive = recovery / 'backup.tar'
+                with tarfile.open(archive) as saved:
+                    names = saved.getnames()
+                    self.assertIn('config/config.php', names)
+                    self.assertIn('database.sql.gz', names)
+                    self.assertIn('custom/apps/extra/custom.php', names)
+                    self.assertIn('custom/themes/custom/style.css', names)
+                    self.assertEqual('data/sentinel' in names, enabled == 'yes')
+                    self.assertNotIn('backup.tar', names)
+                    self.assertEqual(saved.extractfile('phase').read(), b'backups-ready\n')
+                self.assertEqual((recovery / 'backup.tar.sha256').read_text().split()[0], hashlib.sha256(archive.read_bytes()).hexdigest())
+                self.assertFalse((recovery / 'backup.tar.partial').exists())
+                restored = f.root / 'restore'; restored.mkdir()
+                subprocess.run([REAL_TOOLS['tar'], '--acls', '--xattrs', '--numeric-owner', '-xpf', str(archive), '-C', str(restored)], check=True, capture_output=True)
+                self.assertEqual((restored / 'config/config.php').read_text(), 'configuration')
+                self.assertEqual((restored / 'custom/apps/extra/custom.php').read_text(), 'custom app')
+                if enabled == 'yes':
+                    self.assertEqual((restored / 'data/sentinel').stat().st_mode & 0o777, 0o604)
+                    self.assertEqual(os.readlink(restored / 'data/link'), '/does/not/exist')
+                    if 'user.backup-test' in os.listxattr(f.data / 'sentinel'):
+                        self.assertEqual(os.getxattr(restored / 'data/sentinel', 'user.backup-test'), b'preserve attributes')
+
+    def test_archive_works_without_custom_components(self):
+        f = self.fixture()
+        for path in ('custom_apps', 'apps/extra', 'themes/custom'): shutil.rmtree(f.root / 'nextcloud' / path)
+        self.assertEqual(f.run_upgrade(extra={'BACKUP_ARCHIVE': 'yes', 'EXTRA_APPS_PATHS': '[]'}).returncode, 0, f.output)
+        recovery = next((f.root / 'backups').glob('upgrade-*'))
+        with tarfile.open(recovery / 'backup.tar') as saved:
+            self.assertIn('config/config.php', saved.getnames())
+            self.assertNotIn('custom', saved.getnames())
+            self.assertNotIn('data', saved.getnames())
+
+    def test_archive_failures_keep_directory_backup_and_restore_original(self):
+        for mode in ('archive-create', 'archive-check'):
+            with self.subTest(mode=mode):
+                f = self.fixture(relative='data')
+                self.assertNotEqual(f.run_upgrade(mode, extra={'BACKUP_DATA': 'yes', 'BACKUP_ARCHIVE': 'yes'}).returncode, 0, f.output)
+                self.assert_recovered(f)
+                recovery = next((f.root / 'backups').glob('upgrade-*'))
+                self.assertTrue((recovery / 'database.sql.gz').exists())
+                self.assertTrue((recovery / 'data/sentinel').exists())
+                self.assertTrue((recovery / 'backup.tar.partial').exists())
+                self.assertFalse((recovery / 'backup.tar').exists())
+
+    def test_changed_data_directory_requires_manual_recovery(self):
+        f = self.fixture()
+        self.assertNotEqual(f.run_upgrade('data-replaced', extra={'BACKUP_DATA': 'yes'}).returncode, 0, f.output)
+        self.assertIn('Configured data directory or its mount changed', f.output)
+        self.assertTrue(json.loads((f.root / 'status').read_text())['maintenance'])
+        self.assertEqual(json.loads((f.root / 'services').read_text()), {'nginx': 'inactive', 'php8.4-fpm': 'inactive'})
+        self.assertTrue((f.root / 'backups/upgrade-active').exists())
+        self.assertEqual((f.root / 'original-data/sentinel').read_text(), 'Never modify or duplicate EFS data')
+        self.assertNotIn('occ upgrade', (f.root / 'events').read_text())
+
+    def test_internal_data_mount_with_spaces_is_detected_before_maintenance(self):
+        f = self.fixture(relative='private/user files')
+        self.assertNotEqual(f.run_upgrade('data-mount').returncode, 0, f.output)
+        self.assertIn('Mount inside application tree', f.output)
+        self.assertNotIn('occ maintenance:mode', (f.root / 'events').read_text())
+
+    def test_invalid_backup_options_are_rejected_before_changes(self):
+        f = self.fixture()
+        for extra in ({'BACKUP_ARCHIVE': 'maybe'}, {'BACKUP_SSH_DEST': '-option:/backups'},
+                      {'BACKUP_SSH_DEST': 'backup-host:relative'}, {'BACKUP_SSH_DEST': 'backup-host:/'}):
+            with self.subTest(extra=extra):
+                self.assertNotEqual(f.run_upgrade(extra=extra).returncode, 0, f.output)
+                self.assertNotIn('occ maintenance:mode', (f.root / 'events').read_text())
+
+    def test_ssh_sends_valid_archive_with_safe_remote_path_before_migration(self):
+        for archive in ('no', 'yes'):
+            with self.subTest(archive=archive):
+                f = self.fixture(relative='data')
+                remote = f.root / "remote store's $(touch escaped)"; remote.mkdir()
+                extra = {'BACKUP_DATA': 'yes', 'BACKUP_ARCHIVE': archive, 'BACKUP_SSH_DEST': 'backup@backup-host:' + str(remote)}
+                self.assertEqual(f.run_upgrade(extra=extra).returncode, 0, f.output)
+                saved_archive = next(remote.glob('upgrade-*.tar'))
+                self.assertEqual(saved_archive.stat().st_mode & 0o777, 0o600)
+                with tarfile.open(saved_archive) as saved:
+                    self.assertEqual(saved.extractfile('data/users/.hidden').read(), b'private content')
+                    self.assertEqual(saved.extractfile('phase').read(), b'backups-ready\n')
+                events = (f.root / 'events').read_text()
+                self.assertLess(events.index('ssh check'), events.index('occ maintenance:mode'))
+                self.assertLess(events.index('data verify'), events.index('ssh copy'))
+                self.assertLess(events.index('ssh copy'), events.index('occ upgrade'))
+                self.assertFalse((f.root / 'escaped').exists())
+
+    def test_ssh_failures_prevent_migration_and_preserve_local_backup(self):
+        for mode in ('ssh-connect', 'ssh-copy'):
+            with self.subTest(mode=mode):
+                f = self.fixture(); remote = f.root / 'remote'; remote.mkdir()
+                self.assertNotEqual(f.run_upgrade(mode, extra={'BACKUP_SSH_DEST': 'backup@backup-host:' + str(remote)}).returncode, 0, f.output)
+                self.assert_recovered(f)
+                if mode == 'ssh-connect':
+                    self.assertNotIn('occ maintenance:mode', (f.root / 'events').read_text())
+                else:
+                    recovery = next((f.root / 'backups').glob('upgrade-*'))
+                    self.assertTrue((recovery / 'database.sql.gz').exists())
 
 @unittest.skipUnless(REAL_PHP, 'PHP with SimpleXML required; set TEST_PHP')
 class WebServerTests(unittest.TestCase):
