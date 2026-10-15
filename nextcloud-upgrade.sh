@@ -7,7 +7,12 @@ NEXTCLOUD_PATH="${NEXTCLOUD_PATH:-/var/www/nextcloud}"
 BACKUP_PATH="${BACKUP_PATH:-/var/backups/nextcloud}"
 SERVICE_MANAGER="${SERVICE_MANAGER:-monit}"
 WEB_SERVICE="${WEB_SERVICE:-nginx}"
+# Use 'none' only when PHP runs inside the web-server process (e.g. mod_php).
 PHP_SERVICE="${PHP_SERVICE:-php8.4-fpm}"
+managed_services=("$WEB_SERVICE")
+if [[ $PHP_SERVICE != none ]]; then
+    managed_services+=("$PHP_SERVICE")
+fi
 WAIT_BEFORE_BACKUP="${WAIT_BEFORE_BACKUP:-60}"
 WAIT_AFTER_SERVER_START="${WAIT_AFTER_SERVER_START:-20}"
 DOWNLOAD_FORMAT="${DOWNLOAD_FORMAT:-tar.bz2}"
@@ -99,7 +104,11 @@ service_control() {
 
 check_services() {
     local service
-    for service in "$WEB_SERVICE" "$PHP_SERVICE"; do
+    [[ ${WEB_SERVICE%.service} != "${PHP_SERVICE%.service}" ]] || fail 'WEB_SERVICE and PHP_SERVICE must be different; use PHP_SERVICE=none for embedded PHP.'
+    if [[ $PHP_SERVICE == none && ${WEB_SERVICE%.service} == nginx ]]; then
+        fail 'Nginx requires a separate PHP-FPM service; PHP_SERVICE=none is for embedded PHP.'
+    fi
+    for service in "${managed_services[@]}"; do
         [[ $service =~ ^[A-Za-z0-9_.@-]+$ ]] || fail 'Invalid service name.'
         [[ $(systemctl show "$service" --property=LoadState --value) == loaded ]] || fail "Unknown systemd service: $service"
         [[ $(systemctl show "$service" --property=ActiveState --value) == active ]] || fail "Service must already be running: $service"
@@ -120,17 +129,21 @@ wait_service() {
     return 1
 }
 stop_services() {
-    local rc=0
-    # Try both even when one fails: stopped PHP still blocks application access.
-    service_control stop "$WEB_SERVICE" && wait_service "$WEB_SERVICE" inactive || rc=1
-    service_control stop "$PHP_SERVICE" && wait_service "$PHP_SERVICE" inactive || rc=1
+    local rc=0 service
+    # Stop the frontend first; still try every service when one stop fails.
+    for service in "${managed_services[@]}"; do
+        service_control stop "$service" && wait_service "$service" inactive || rc=1
+    done
     return "$rc"
 }
 start_services() {
-    service_control start "$PHP_SERVICE" || return 1
-    wait_service "$PHP_SERVICE" active || return 1
-    service_control start "$WEB_SERVICE" || return 1
-    wait_service "$WEB_SERVICE" active || return 1
+    local i service
+    # Start a separate PHP runtime before the frontend, when configured.
+    for ((i=${#managed_services[@]}-1; i>=0; i--)); do
+        service=${managed_services[i]}
+        service_control start "$service" || return 1
+        wait_service "$service" active || return 1
+    done
 }
 restore_cron() {
     [[ $cron_changed == yes ]] || return 0
@@ -406,7 +419,7 @@ old_path="${NEXTCLOUD_PATH}.old.${recovery##*/}"
 cp -- "$workspace/cron.original" "$workspace/cron.disabled" "$recovery/"
 printf 'installation=%s\nprevious_version=%s\ntarget_version=%s\nold_application=%s\nstaging=%s\nworkspace=%s\ndatabase_type=%s\ndatabase_name=%s\nservice_manager=%s\nweb_service=%s\nphp_service=%s\n' \
     "$NEXTCLOUD_PATH" "$current_version" "$download_version" "$old_path" "$stage" "$workspace" "$db_type" "$db_name" "$SERVICE_MANAGER" "$WEB_SERVICE" "$PHP_SERVICE" > "$recovery/manifest"
-set_phase quiescing "Enabling maintenance, disabling Nextcloud cron, and stopping web/PHP services through $SERVICE_MANAGER."
+set_phase quiescing "Enabling maintenance, disabling Nextcloud cron, and stopping application services through $SERVICE_MANAGER."
 printf '%s\n' "$recovery" > "$BACKUP_PATH/upgrade-active"
 sync -f "$BACKUP_PATH"
 production_changed=yes
@@ -488,7 +501,7 @@ set_phase verifying 'Checking installed version, database migration state, and m
 # occ may change maintenance itself; services and cron are still stopped.
 occ maintenance:mode --on
 occ status --output=json | php_info status on "$download_version" > "$recovery/status.version"
-set_phase restoring 'Starting PHP/web services under maintenance, then restoring cron.'
+set_phase restoring 'Starting application services under maintenance, then restoring cron.'
 start_services
 restore_cron
 occ maintenance:mode --off

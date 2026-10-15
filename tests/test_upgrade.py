@@ -63,7 +63,7 @@ if name == 'sudo':
         if a[1] == '--off': fail_once('maintenance-off')
         s['maintenance'] = a[1] == '--on'; save('status', s)
     elif a[0] == 'upgrade':
-        assert load('services') == {'nginx': 'inactive', 'php8.4-fpm': 'inactive'}
+        assert all(state == 'inactive' for state in load('services').values())
         assert '# nextcloud-upgrade:' in (root / 'cron').read_text()
         s['version'] = '34.0.1.0'
         if mode in ('migration', 'signal-migration', 'hup-migration', 'kill-migration'):
@@ -114,7 +114,7 @@ elif name == 'monit' or (name == 'systemctl' and args[0] in ('start', 'stop')):
         assert os.environ.get('SERVICE_MANAGER') == 'systemd', 'Wrong service backend'
     action, svc = args
     event(name + ' ' + action + ' ' + svc)
-    assert svc in ('nginx', 'php8.4-fpm')
+    assert svc in load('services'), svc
     if action == 'stop': fail_once('stop-' + svc)
     if action == 'start': fail_once('start-' + svc)
     state = load('services')
@@ -134,7 +134,7 @@ elif name == 'monit' or (name == 'systemctl' and args[0] in ('start', 'stop')):
 elif name == 'systemctl':
     assert args[0] == 'show'
     if '--property=LoadState' in args:
-        print('not-found' if mode == 'missing-unit' else 'loaded')
+        print('not-found' if mode == 'missing-unit' or args[1] not in load('services') else 'loaded')
     else:
         svc = args[1]
         pending = root / ('pending-' + svc)
@@ -169,7 +169,7 @@ elif name in ('mariadb', 'mysql', 'psql'):
 elif name in ('mariadb-dump', 'mysqldump', 'pg_dump'):
     event('dump')
     assert load('status')['maintenance']
-    assert load('services') == {'nginx': 'inactive', 'php8.4-fpm': 'inactive'}
+    assert all(state == 'inactive' for state in load('services').values())
     assert '# nextcloud-upgrade:' in (root / 'cron').read_text()
     if mode == 'signal-backup': os.kill(int(os.environ['UPGRADE_PID']), signal.SIGINT); time.sleep(.2); die(130)
     if mode == 'backup': print('partial sql'); die(27)
@@ -573,5 +573,83 @@ class MonitUpgradeTests(UpgradeScenarios, unittest.TestCase):
 
 class SystemdUpgradeTests(UpgradeScenarios, unittest.TestCase):
     service_manager = 'systemd'
+
+@unittest.skipUnless(REAL_PHP, 'PHP with SimpleXML required; set TEST_PHP')
+class WebServerTests(unittest.TestCase):
+    def fixture(self, manager, web='apache2', php='php8.4-fpm'):
+        cls = MonitUpgradeTests if manager == 'monit' else SystemdUpgradeTests
+        fixture = cls('test_success_preserves_config_apps_themes_schedule_and_recovery')
+        fixture.setUp()
+        fixture.env.update(WEB_SERVICE=web, PHP_SERVICE=php)
+        services = {web: 'active'}
+        if php != 'none': services[php] = 'active'
+        (fixture.root / 'services').write_text(json.dumps(services))
+        self.addCleanup(fixture.doCleanups)
+        return fixture, services
+
+    def test_apache_service_names_and_php_layouts(self):
+        for manager in ('monit', 'systemd'):
+            for web in ('apache2', 'httpd'):
+                for php in ('php8.4-fpm', 'none'):
+                    with self.subTest(manager=manager, web=web, php=php):
+                        fixture, original = self.fixture(manager, web, php)
+                        self.assertEqual(fixture.run_upgrade().returncode, 0, fixture.output)
+                        self.assertEqual(json.loads((fixture.root / 'services').read_text()), original)
+                        self.assertFalse(json.loads((fixture.root / 'status').read_text())['maintenance'])
+                        self.assertEqual((fixture.root / 'cron').read_text(), fixture.original_cron)
+                        events = (fixture.root / 'events').read_text().splitlines()
+                        actions = [line for line in events if line.startswith(('monit start ', 'monit stop ', 'systemctl start ', 'systemctl stop '))]
+                        stop = [web] + ([php] if php != 'none' else [])
+                        expected = [f'{fixture.service_command} stop {service}' for service in stop]
+                        expected += [f'{fixture.service_command} start {service}' for service in reversed(stop)]
+                        self.assertEqual(actions, expected)
+                        manifest = next((fixture.root / 'backups').glob('upgrade-*/manifest')).read_text()
+                        self.assertIn('web_service=' + web + '\n', manifest)
+                        self.assertIn('php_service=' + php + '\n', manifest)
+
+    def test_apache_failures_recover_or_remain_blocked(self):
+        for manager in ('monit', 'systemd'):
+            for php in ('php8.4-fpm', 'none'):
+                for mode in ('backup', 'new-rename', 'migration', 'start-apache2', 'stop-timeout'):
+                    with self.subTest(manager=manager, php=php, mode=mode):
+                        fixture, original = self.fixture(manager, php=php)
+                        self.assertNotEqual(fixture.run_upgrade(mode).returncode, 0, fixture.output)
+                        status = json.loads((fixture.root / 'status').read_text())
+                        services = json.loads((fixture.root / 'services').read_text())
+                        marker = fixture.root / 'backups/upgrade-active'
+                        if mode in ('backup', 'new-rename'):
+                            self.assertEqual((fixture.root / 'nextcloud/occ').read_text(), 'old-code')
+                            self.assertEqual(services, original)
+                            self.assertFalse(status['maintenance'])
+                            self.assertFalse(marker.exists())
+                            self.assertEqual((fixture.root / 'cron').read_text(), fixture.original_cron)
+                        else:
+                            self.assertTrue(status['maintenance'], fixture.output)
+                            self.assertTrue(marker.exists(), fixture.output)
+                            self.assertIn('# nextcloud-upgrade:', (fixture.root / 'cron').read_text())
+                            if mode != 'stop-timeout':
+                                self.assertTrue(all(state == 'inactive' for state in services.values()))
+                                self.assertEqual((fixture.root / 'nextcloud/occ').read_text(), 'new-code')
+                        self.assertEqual((fixture.root / 'storage/sentinel').read_text(), 'Never modify or duplicate EFS data')
+                        if php == 'none':
+                            self.assertNotIn('php8.4-fpm', (fixture.root / 'events').read_text())
+
+    def test_nginx_without_separate_php_is_rejected(self):
+        for manager in ('monit', 'systemd'):
+            with self.subTest(manager=manager):
+                fixture, services = self.fixture(manager, web='nginx', php='none')
+                self.assertNotEqual(fixture.run_upgrade().returncode, 0, fixture.output)
+                self.assertIn('Nginx requires a separate PHP-FPM service', fixture.output)
+                self.assertEqual(json.loads((fixture.root / 'services').read_text()), services)
+                self.assertFalse((fixture.root / 'backups/upgrade-active').exists())
+
+    def test_same_web_and_php_unit_is_rejected(self):
+        for php in ('apache2', 'apache2.service'):
+            with self.subTest(php=php):
+                fixture, services = self.fixture('systemd', php=php)
+                self.assertNotEqual(fixture.run_upgrade().returncode, 0, fixture.output)
+                self.assertIn('WEB_SERVICE and PHP_SERVICE must be different', fixture.output)
+                self.assertEqual(json.loads((fixture.root / 'services').read_text()), services)
+                self.assertFalse((fixture.root / 'backups/upgrade-active').exists())
 
 if __name__ == '__main__': unittest.main(verbosity=2)

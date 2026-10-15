@@ -11,14 +11,14 @@ disk before the installation is taken offline.
 
 ## Requirements
 
-The script supports a conventional Linux installation with:
+The script supports an archive-based Nextcloud installation on Linux with:
 
 - Bash, GNU command-line utilities and PHP CLI with SimpleXML, available as `php`.
 - Nextcloud commands and cron jobs running as `www-data`.
-- A web server and PHP-FPM with systemd service units. Both services must already
-  be running. Nginx is the default web server; service names are configurable.
+- A web server with a systemd service unit: Nginx with PHP-FPM, or Apache 2.4
+  with PHP-FPM or `mod_php`. Managed services must already be running.
 - Monit, when using the default service manager. Its service names must match
-  the systemd unit names, and both services must already be monitored.
+  the systemd unit names, and all selected services must already be monitored.
 - MariaDB/MySQL or PostgreSQL. Database settings are read from Nextcloud.
 - A user-data directory outside the Nextcloud installation directory.
 - Enough disk space and inodes for the downloaded release, extracted files,
@@ -64,9 +64,10 @@ installed copy, update your checkout, review the changes, and repeat the script
 installation command.
 
 Before the first upgrade, confirm that your installation matches the requirements,
-review the target Nextcloud release notes and app compatibility, and verify that
-your separate data backups are available. Schedule an interruption to web access
-and background jobs.
+review the target Nextcloud release notes and app compatibility, disable
+third-party apps as directed by Nextcloud, and verify that your separate data
+backups are available. Schedule an interruption to web access and background
+jobs. Stopping a selected service affects every site or PHP pool that it hosts.
 
 ## Running an upgrade
 
@@ -83,8 +84,9 @@ continue; any other answer cancels. Cancellation at this prompt leaves the
 installation running, although downloads and preparation have already occurred.
 
 After confirmation, the script enables maintenance mode, suspends this
-installation's cron entries, stops the web server and PHP-FPM through the selected
-service manager, waits for existing Nextcloud CLI jobs to finish, and creates
+installation's cron entries, stops the web server and any configured separate
+PHP-FPM service through the selected manager, waits for existing Nextcloud CLI
+jobs to finish, and creates
 the recovery backups. It then
 replaces the application, runs `occ upgrade`, verifies the installed version and
 database migration state, and restores services and the original cron schedule.
@@ -96,13 +98,16 @@ major version. For example, when upgrading 34.0.0 to 34.0.1:
 sudo nextcloud-upgrade 34.0.1
 ```
 
-Use automatic discovery for major upgrades. Downgrades and upgrades that skip a
-major version are rejected. Automatic discovery requires the stable update
+Use automatic discovery for major upgrades, after installing the latest
+maintenance release of the current major version. Downgrades and upgrades that
+skip a major version are rejected. Automatic discovery requires the stable update
 channel; Nextcloud's release requirements and compatibility guidance still apply.
 
 After the script finishes, open Nextcloud, check Administration Overview, test a
 file upload/download and client sync, and confirm that background jobs resume.
-The script's local checks do not replace verification through your web interface.
+Re-enable compatible third-party apps after verification. Before another major
+upgrade, allow any background migrations to finish. The script's local checks
+do not replace verification through your web interface.
 
 ## Options and examples
 
@@ -121,7 +126,7 @@ sudo env NEXTCLOUD_PATH=/srv/nextcloud \
 | `BACKUP_PATH` | `/var/backups/nextcloud` | Directory for upgrade recovery backups. |
 | `SERVICE_MANAGER` | `monit` | Service control backend: `monit` or `systemd`. |
 | `WEB_SERVICE` | `nginx` | Web-server systemd unit name; also the Monit name when selected. |
-| `PHP_SERVICE` | `php8.4-fpm` | PHP-FPM systemd unit name; also the Monit name when selected. |
+| `PHP_SERVICE` | `php8.4-fpm` | Separate PHP-FPM service name, or `none` for PHP embedded in the web server. |
 | `WAIT_BEFORE_BACKUP` | `60` | Maximum seconds to wait for existing Nextcloud cron/occ processes after services stop. |
 | `WAIT_AFTER_SERVER_START` | `20` | Maximum seconds to poll each service state after its start/stop command returns. |
 | `DOWNLOAD_FORMAT` | `tar.bz2` | Release archive format: `tar.bz2` or `zip`. |
@@ -145,6 +150,34 @@ Monit applies its configured dependencies: for example, if PHP-FPM depends on
 Nginx, stopping Nginx through Monit also stops PHP-FPM. Startup may likewise
 start a prerequisite service automatically; maintenance remains enabled until
 the upgrade has been verified.
+
+### Choosing the web server
+
+`WEB_SERVICE` is the actual service name, not a web-server installation option.
+The default is `nginx` with a separate `php8.4-fpm` service. For Apache with
+PHP-FPM on Debian/Ubuntu:
+
+```bash
+sudo env WEB_SERVICE=apache2 PHP_SERVICE=php8.4-fpm nextcloud-upgrade
+```
+
+For Apache with `mod_php`, PHP runs inside Apache, so select only its service:
+
+```bash
+sudo env WEB_SERVICE=apache2 PHP_SERVICE=none nextcloud-upgrade
+```
+
+Use `WEB_SERVICE=httpd` instead when that is your actual service name. These
+settings can be combined with `SERVICE_MANAGER=systemd`. Nextcloud commands and
+file ownership still use `www-data`; changing the service name does not change
+that requirement or configure the web server.
+
+`PHP_SERVICE=none` explicitly means there is no separate PHP runtime to manage.
+It does not detect the PHP setup. Only the web service is then checked, stopped
+and started, including during recovery; restarting it also replaces its embedded
+PHP workers and OPcache. Nginx requires a separate PHP-FPM service, so the
+combination `WEB_SERVICE=nginx PHP_SERVICE=none` is rejected. Keep any separate
+runtime configured so existing PHP requests cannot continue during replacement.
 
 For a different PHP-FPM service and a longer service-state polling timeout:
 
@@ -249,6 +282,15 @@ Set `TEST_PHP=/path/to/php` to select another PHP executable. Tests use isolated
 files and mocked Nextcloud, database and service commands; no root access,
 network connection or running Nextcloud installation is required. Preserve
 coverage of failures around backup, replacement, migration and restoration.
+
+For supported server/PHP combinations and release-specific upgrade requirements,
+consult Nextcloud's [system requirements](https://docs.nextcloud.com/server/stable/admin_manual/installation/system_requirements.html),
+[manual upgrade instructions](https://docs.nextcloud.com/server/stable/admin_manual/maintenance/manual_upgrade.html)
+and [release notes](https://docs.nextcloud.com/server/stable/admin_manual/release_notes/index.html).
+Use documentation matching the installed and target releases; the `/latest/`
+manual can describe an upcoming development version. The script validates CLI
+PHP against the downloaded release; web-PHP extensions and database-version
+compatibility must also meet that release's requirements.
 
 ## License
 
