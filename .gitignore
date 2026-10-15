@@ -2,3 +2,10 @@
 
 # log files
 .log
+
+# Local experiments
+/.dev/
+
+# Release packages and Python test caches
+/dist/
+__pycache__/
