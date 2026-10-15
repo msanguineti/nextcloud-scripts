@@ -2,10 +2,14 @@
 # Upgrade one conventional Nextcloud installation. See README.md for usage and recovery.
 set -Eeuo pipefail
 umask 077
+# Version of this tool, independent of the Nextcloud version being installed.
+readonly SCRIPT_VERSION='0.1.0'
 
 usage() {
+    printf 'Nextcloud Upgrade Script %s\n\n' "$SCRIPT_VERSION"
     printf '%s\n' 'Usage: nextcloud-upgrade.sh [stable-version]
        nextcloud-upgrade.sh --help
+       nextcloud-upgrade.sh --version
 
 Upgrade one archive-based Nextcloud installation on a systemd Linux host.
 Without a version, discover the next eligible stable release. An explicit
@@ -42,6 +46,11 @@ See README.md for requirements, supported layouts, backups and recovery.'
 if [[ ${1:-} == --help || ${1:-} == -h ]]; then
     [[ $# == 1 ]] || { printf '%s\n' 'Use --help on its own.' >&2; exit 2; }
     usage
+    exit 0
+fi
+if [[ ${1:-} == --version ]]; then
+    [[ $# == 1 ]] || { printf '%s\n' 'Use --version on its own.' >&2; exit 2; }
+    printf 'nextcloud-upgrade %s\n' "$SCRIPT_VERSION"
     exit 0
 fi
 

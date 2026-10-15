@@ -73,23 +73,50 @@ and do not block an upgrade.
 
 ## Installation
 
-Clone the repository on the server that runs Nextcloud:
+### Download a release
+
+Download the `.tar.gz` package and matching `.sha256` file from
+[GitHub Releases](https://github.com/msanguineti/nextcloud-scripts/releases).
+The package contains the script, this README and the license. Git and Docker are
+not required to install or run it; the server dependencies listed above still apply.
+
+For example, to download script release `v0.1.0` once published:
 
 ```bash
-git clone https://github.com/msanguineti/nextcloud-scripts.git
-cd nextcloud-scripts
+curl --fail --location --remote-name https://github.com/msanguineti/nextcloud-scripts/releases/download/v0.1.0/nextcloud-upgrade-v0.1.0.tar.gz
+curl --fail --location --remote-name https://github.com/msanguineti/nextcloud-scripts/releases/download/v0.1.0/nextcloud-upgrade-v0.1.0.tar.gz.sha256
+sha256sum -c nextcloud-upgrade-v0.1.0.tar.gz.sha256
+tar -xzf nextcloud-upgrade-v0.1.0.tar.gz
+cd nextcloud-upgrade-v0.1.0
 ```
+
+Choose the desired version from Releases and substitute its tag in these commands.
+Check that the checksum succeeds before extracting. It detects download corruption;
+it is fetched from the same release and is not an independent signature.
 
 Install the script and create its default backup directory:
 
 ```bash
 sudo install -o root -g root -m 0755 nextcloud-upgrade.sh /usr/local/sbin/nextcloud-upgrade
 sudo install -d -o root -g root -m 0700 /var/backups/nextcloud
+nextcloud-upgrade --version
 ```
 
-Alternatively, run `sudo ./nextcloud-upgrade.sh` from the checkout. To update an
-installed copy, update your checkout, review the changes, and repeat the script
-installation command.
+### Clone instead
+
+You can also clone the repository on the server that runs Nextcloud:
+
+```bash
+git clone https://github.com/msanguineti/nextcloud-scripts.git
+cd nextcloud-scripts
+```
+
+Then use the same installation commands above, or run `sudo ./nextcloud-upgrade.sh`
+from the checkout. To update an installed script, download and verify a newer
+release (or update your checkout), review its changes, and repeat the script
+installation command. Replacing the script does not itself upgrade Nextcloud.
+
+### Prepare the server
 
 Before the first upgrade, confirm that your installation matches the requirements,
 review the target Nextcloud release notes and app compatibility, disable
@@ -119,7 +146,11 @@ root access:
 
 ```bash
 nextcloud-upgrade --help
+nextcloud-upgrade --version
 ```
+
+`--version` reports the version of this upgrade script; a positional version such
+as `34.0.1` selects a Nextcloud release to install.
 
 The script checks the installation, downloads and validates the release, stages
 the new files, and checks database access and backup capacity. It then displays
@@ -542,20 +573,64 @@ data copy; `backup_stream` supplies the same restore components to local packagi
 and optional SSH transfer.
 Keep ownership/deletion operations away from the user-data directory.
 
-Run local checks from the repository:
+Run the same checks used by GitHub Actions from the repository:
 
 ```bash
-bash -n nextcloud-upgrade.sh
-shellcheck nextcloud-upgrade.sh
-python3 tests/test_upgrade.py
+bash .github/scripts/check.sh
 ```
 
-Tests require Python 3, PHP 8.4 or newer with SimpleXML, both archive toolsets and
-`rsync` for data backup cases.
-Set `TEST_PHP=/path/to/php` to select another PHP executable. Tests use isolated
+Checks require ShellCheck, Python 3, PHP 8.4 or newer with SimpleXML, both archive
+toolsets and `rsync` for data backup cases. Set `TEST_PHP=/path/to/php` to select
+another PHP executable. Missing dependencies or skipped tests fail the shared
+check command. Tests use isolated
 files and mocked Nextcloud, database and service commands; no root access,
-network connection or running Nextcloud installation is required. Preserve
+network connection, Docker or running Nextcloud installation is required. The
+release tests build, verify, unpack and install the package into a temporary
+directory. Preserve
 coverage of failures around backup, replacement, migration and restoration.
+
+### Publishing a script release
+
+The script starts at `0.1.0`; its version is independent of Nextcloud's. During
+initial development, increment the patch for fixes and the minor version for
+new features or changed behavior. Reserve `1.0.0` for a stable documented
+interface, following [Semantic Versioning](https://semver.org/).
+
+Update `SCRIPT_VERSION` near the top of the script, run the checks, and merge
+the changes into `main`. Tag that commit with the matching version and push the
+tag, for example from an up-to-date `main` checkout:
+
+```bash
+git tag -a v0.1.0 -m "Release v0.1.0"
+git push origin v0.1.0
+```
+
+Pushing the version tag starts **Prepare release** in GitHub Actions. It tests
+the tagged commit, then creates a **draft release** containing
+`nextcloud-upgrade-v0.1.0.tar.gz`, its `.sha256` file and generated release notes.
+Tags must match `SCRIPT_VERSION`; a tag such as `v0.1.0-rc.1` is also marked as
+a pre-release. Use the built-in `GITHUB_TOKEN`; no personal access token or
+custom repository secret is needed.
+
+Once the workflow succeeds, open the draft under **Releases**, review the notes
+and both downloads, then click **Publish release**. Publication is manual;
+the workflow never publishes or replaces an existing release. If preparation
+fails and leaves an incomplete draft, delete that draft before rerunning the
+failed job.
+Release immutability can stay enabled: all files are attached before
+publication, following [GitHub's recommended sequence](https://docs.github.com/en/code-security/concepts/supply-chain-security/immutable-releases).
+
+To build the same package locally without publishing it:
+
+```bash
+bash .github/scripts/package-release.sh v0.1.0
+```
+
+This writes the archive and checksum into `dist/`. The package includes only
+`nextcloud-upgrade.sh`, `README.md` and `LICENSE.md`. CI runs the same checks for
+PRs targeting `main` and every push to `main`, including merges. To require a
+passing result before merging, select the `Checks` status in the repository's
+branch protection or ruleset; workflow files alone do not enable that policy.
 
 For supported server/PHP combinations and release-specific upgrade requirements,
 consult Nextcloud's [system requirements](https://docs.nextcloud.com/server/stable/admin_manual/installation/system_requirements.html),
