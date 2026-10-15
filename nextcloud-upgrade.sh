@@ -3,7 +3,7 @@
 set -Eeuo pipefail
 umask 077
 # Version of this tool, independent of the Nextcloud version being installed.
-readonly SCRIPT_VERSION='0.1.0'
+readonly SCRIPT_VERSION='1.0.0'
 
 usage() {
     printf 'Nextcloud Upgrade Script %s\n\n' "$SCRIPT_VERSION"
@@ -31,7 +31,8 @@ Options are environment variables (pass them with sudo env):
   PRESERVE_PATHS_FILE     Optional list of extra installation-relative paths
   DOWNLOAD_FORMAT        tar.bz2 or zip (tar.bz2)
   CHECKSUM_TYPE           sha256, sha512 or md5 (sha256)
-  WAIT_BEFORE_BACKUP      Seconds for existing cron/occ jobs to finish (60)
+  WAIT_AFTER_MAINTENANCE  Grace period before stopping web/PHP services (30)
+  WAIT_BEFORE_BACKUP      Maximum wait for existing cron/occ jobs to finish (60)
   WAIT_AFTER_SERVER_START Seconds to wait for each service state change (20)
   NO_COLOR               Set to disable terminal colours
 
@@ -67,6 +68,7 @@ managed_services=("$WEB_SERVICE")
 if [[ $PHP_SERVICE != none ]]; then
     managed_services+=("$PHP_SERVICE")
 fi
+WAIT_AFTER_MAINTENANCE="${WAIT_AFTER_MAINTENANCE:-30}"
 WAIT_BEFORE_BACKUP="${WAIT_BEFORE_BACKUP:-60}"
 WAIT_AFTER_SERVER_START="${WAIT_AFTER_SERVER_START:-20}"
 DOWNLOAD_FORMAT="${DOWNLOAD_FORMAT:-tar.bz2}"
@@ -85,10 +87,13 @@ production_changed=no
 replacement_started=no
 migration_started=no
 cron_changed=no
-cron_was_present=yes
+cron_was_present=not-inspected
+manage_cron=no
+background_mode=''
 finished=no
 upgrade_started=$SECONDS
 offline_started=''
+progress_pid=''
 
 log() {
     local symbol='[i]' color=36
@@ -105,6 +110,41 @@ log() {
         printf '%s [%s] %s\n' "$symbol" "$phase" "$*"
     fi
 }
+# Status goes to stderr so command output can still be saved or piped safely.
+stop_progress() {
+    if [[ -n $progress_pid ]]; then
+        kill "$progress_pid" 2>/dev/null || true
+        wait "$progress_pid" 2>/dev/null || true
+        progress_pid=''
+    fi
+}
+start_progress() {
+    stop_progress
+    local message=$1 started=$SECONDS
+    log "$message" >&2
+    (
+        # This display process must never inherit the upgrade's recovery traps.
+        trap - EXIT ERR INT TERM HUP
+        set +e
+        timer=''
+        trap 'for timer in $(jobs -pr); do kill "$timer" 2>/dev/null; done; wait; exit 0' INT TERM HUP
+        while :; do
+            sleep 15 &
+            wait "$!" || exit 0
+            log "$message ($((SECONDS - started))s elapsed; still running)." >&2
+        done
+    ) &
+    progress_pid=$!
+}
+with_progress() {
+    local message=$1
+    shift
+    start_progress "$message"
+    # Keep the actual operation in the foreground, with the normal error traps.
+    "$@"
+    stop_progress
+}
+
 fail() { log --error "ERROR: $*" >&2; exit 1; }
 need() { command -v "$1" >/dev/null || fail "Required command missing: $1"; }
 occ() { (cd "$NEXTCLOUD_PATH" && sudo -u "$WEB_USER" "$PHP_BIN" ./occ "$@"); }
@@ -200,7 +240,8 @@ backup_data() {
 
 shell_quote() { printf "'%s'" "${1//\'/\'\\\'\'}"; }
 backup_stream() {
-    local file entries=(config database.sql.gz manifest preserved-paths cron.original cron.disabled phase)
+    local file entries=(config database.sql.gz manifest preserved-paths phase)
+    if [[ $manage_cron == yes ]]; then entries+=(cron.original cron.disabled); fi
     for file in .htaccess .user.ini; do
         if [[ -f $recovery/$file ]]; then entries+=("$file"); fi
     done
@@ -383,6 +424,7 @@ read_cron() {
     return 1
 }
 restore_cron() {
+    [[ $manage_cron == yes ]] || return 0
     [[ $cron_changed == yes || $cron_was_present == no ]] || return 0
     read_cron "$recovery/cron.current" || return 1
     if cmp -s "$recovery/cron.original" "$recovery/cron.current"; then
@@ -401,6 +443,7 @@ on_exit() {
     local rc=$? safe=yes
     trap - EXIT ERR INT TERM HUP
     set +e
+    stop_progress
     [[ -z $credentials ]] || rm -f -- "$credentials"
     if [[ $rc != 0 ]]; then
         log --error "FAILED (exit $rc). No successful upgrade is being reported." >&2
@@ -411,23 +454,24 @@ on_exit() {
             printf 'exit=%s\nphase=%s\nmigration_started=%s\n' "$rc" "$phase" "$migration_started" > "$recovery/failure"
 
             if [[ $migration_started == yes ]]; then
-                # Service restoration may already have restored cron. Re-disable only
-                # if it is still exactly one of our known snapshots.
-                if read_cron "$recovery/cron.current"; then
-                    if cmp -s "$recovery/cron.original" "$recovery/cron.current"; then
-                        if [[ $cron_was_present == yes || $cron_read_present == yes ]]; then
-                            crontab -u "$WEB_USER" "$recovery/cron.disabled" || log --error 'Disable Nextcloud cron manually now.' >&2
+                # Re-disable only an account crontab that this run manages.
+                if [[ $manage_cron == yes ]]; then
+                    if read_cron "$recovery/cron.current"; then
+                        if cmp -s "$recovery/cron.original" "$recovery/cron.current"; then
+                            if [[ $cron_was_present == yes || $cron_read_present == yes ]]; then
+                                crontab -u "$WEB_USER" "$recovery/cron.disabled" || log --error 'Disable Nextcloud cron manually now.' >&2
+                            fi
+                        elif ! cmp -s "$recovery/cron.disabled" "$recovery/cron.current"; then
+                            log --warning 'Crontab changed externally; disable Nextcloud cron manually now.' >&2
                         fi
-                    elif ! cmp -s "$recovery/cron.disabled" "$recovery/cron.current"; then
-                        log --warning 'Crontab changed externally; disable Nextcloud cron manually now.' >&2
+                    else
+                        log --error 'Cannot inspect crontab; disable Nextcloud cron manually now.' >&2
                     fi
-                else
-                    log --error 'Cannot inspect crontab; disable Nextcloud cron manually now.' >&2
                 fi
                 # Code alone cannot undo a database migration. Keep every artifact.
                 occ maintenance:mode --on >/dev/null 2>&1
                 stop_services || log --error 'Could not confirm services stopped; block access manually now.' >&2
-                log --warning 'Database migration may have changed state. Keep cron disabled; see README.md (Backups and troubleshooting) for manual recovery.' >&2
+                log --warning 'Database migration may have changed state. Keep maintenance enabled and services stopped; see README.md (Backups and troubleshooting) for manual recovery.' >&2
                 safe=no
             else
                 stop_services || safe=no
@@ -492,7 +536,7 @@ case $SERVICE_MANAGER in
     systemd) ;;
     *) fail 'SERVICE_MANAGER must be monit or systemd.' ;;
 esac
-for cmd in cat sudo curl mktemp flock realpath readlink stat find findmnt df du awk grep sort head tail wc dirname date cmp cp mv rm chmod chown mkdir gzip tee sync crontab systemctl pgrep id getent; do need "$cmd"; done
+for cmd in cat sudo curl mktemp flock realpath readlink stat find findmnt df du awk grep sort head tail wc dirname date cmp cp mv rm chmod chown mkdir gzip tee sync sleep systemctl pgrep id getent; do need "$cmd"; done
 need "$PHP_BIN"
 [[ $WEB_USER =~ ^[A-Za-z_][A-Za-z0-9_.-]*\$?$ ]] || fail 'Invalid WEB_USER account name.'
 web_uid=$(id -u "$WEB_USER") || fail "Unknown WEB_USER: $WEB_USER"
@@ -501,9 +545,10 @@ if [[ -z $WEB_GROUP ]]; then WEB_GROUP=$(id -gn "$WEB_USER"); fi
 [[ $WEB_GROUP =~ ^[A-Za-z_][A-Za-z0-9_.-]*\$?$ ]] || fail 'Invalid WEB_GROUP name.'
 getent group "$WEB_GROUP" > /dev/null || fail "Unknown WEB_GROUP: $WEB_GROUP"
 "$PHP_BIN" -r 'exit(extension_loaded("SimpleXML") ? 0 : 1);' || fail 'PHP SimpleXML is required for update responses.'
-for value in "$WAIT_BEFORE_BACKUP" "$WAIT_AFTER_SERVER_START"; do
+for value in "$WAIT_AFTER_MAINTENANCE" "$WAIT_BEFORE_BACKUP" "$WAIT_AFTER_SERVER_START"; do
     [[ $value =~ ^[0-9]+$ && ${#value} -le 5 ]] || fail 'Wait values must be nonnegative integers (at most five digits).'
 done
+WAIT_AFTER_MAINTENANCE=$((10#$WAIT_AFTER_MAINTENANCE))
 WAIT_BEFORE_BACKUP=$((10#$WAIT_BEFORE_BACKUP))
 WAIT_AFTER_SERVER_START=$((10#$WAIT_AFTER_SERVER_START))
 case $DOWNLOAD_FORMAT in tar.bz2) need tar; need bzip2;; zip) need unzip; need zipinfo;; *) fail 'DOWNLOAD_FORMAT must be tar.bz2 or zip.';; esac
@@ -538,8 +583,23 @@ log "Private workspace: $workspace"
 check_application_tree
 current_version=$(occ status --output=json | php_info status off)
 [[ $current_version =~ ^[0-9]+\.[0-9]+\.[0-9]+(\.[0-9]+)?$ ]] || fail 'Invalid installed version.'
+# Read the setting without changing it; an unset key uses Nextcloud's AJAX default.
+background_mode=$(occ config:app:get core backgroundjobs_mode --default-value=ajax) || fail 'Cannot read the configured background-job mode.'
+case $background_mode in
+    cron)
+        background_label="cron (external scheduler)"
+        if command -v crontab >/dev/null; then
+            manage_cron=yes
+            background_label="cron (account crontab for $WEB_USER)"
+        fi ;;
+    webcron) background_label='WebCron (HTTP requests)' ;;
+    ajax) background_label='AJAX (page requests)' ;;
+    none) background_label='disabled' ;;
+    *) fail "Unsupported background-job mode: $background_mode" ;;
+esac
 check_services
 log "Service manager: $SERVICE_MANAGER"
+log "Background jobs: $background_label"
 
 if [[ $# == 0 ]]; then
     channel=$(config updater.release.channel || true)
@@ -585,8 +645,9 @@ check_space() {
 # Archive links must name a regular file in the same directory. This permits
 # shipped asset/license links without allowing a link to redirect extraction.
 if [[ $DOWNLOAD_FORMAT == tar.bz2 ]]; then
-    tar -tjf "$workspace/$archive_name" > "$workspace/archive.names"
-    tar -tvjf "$workspace/$archive_name" > "$workspace/archive.details"
+    # Two inspection scans precede extraction; each scan decompresses tar.bz2.
+    with_progress 'Archive pass 1/3: reading file paths (full decompression)' tar -tjf "$workspace/$archive_name" > "$workspace/archive.names"
+    with_progress 'Archive pass 2/3: reading file types, links and sizes (full decompression)' tar -tvjf "$workspace/$archive_name" > "$workspace/archive.details"
     awk '
         {t=substr($1,1,1); types[$6]=t}
         t!="-" && t!="d" && t!="l" {bad=1}
@@ -605,8 +666,8 @@ if [[ $DOWNLOAD_FORMAT == tar.bz2 ]]; then
     ' "$workspace/archive.details" || fail 'Archive contains unsafe links or special files.'
     read -r unpacked_bytes entry_count < <(awk '{bytes+=$3;n++} END {printf "%.0f %d\n",bytes,n}' "$workspace/archive.details")
 else
-    unzip -Z1 "$workspace/$archive_name" > "$workspace/archive.names"
-    zipinfo -l "$workspace/$archive_name" > "$workspace/archive.details"
+    with_progress 'Reading ZIP archive paths' unzip -Z1 "$workspace/$archive_name" > "$workspace/archive.names"
+    with_progress 'Reading ZIP archive file types, links and sizes' zipinfo -l "$workspace/$archive_name" > "$workspace/archive.details"
     awk '/^[bcps]/ {exit 1} /^l/ {print $NF}' "$workspace/archive.details" > "$workspace/archive.links" || fail 'ZIP contains special files.'
     : > "$workspace/archive.link-targets"
     while IFS= read -r link; do
@@ -632,24 +693,27 @@ fi
 awk '$0 !~ /^nextcloud(\/|$)/ || $0 ~ /(^|\/)\.\.(\/|$)/ || $0 ~ /\\/ {exit 1}' "$workspace/archive.names" || fail 'Unsafe archive paths.'
 (( unpacked_bytes > 0 && entry_count > 0 )) || fail 'Empty release archive.'
 check_space "$workspace" "$((unpacked_bytes + 104857600))" "$((entry_count + 1000))"
+log --success 'Archive paths, file types, link targets and extraction space checked.'
 if [[ $DOWNLOAD_FORMAT == tar.bz2 ]]; then
-    tar --no-same-owner -xjf "$workspace/$archive_name" -C "$workspace"
+    with_progress 'Archive pass 3/3: extracting the validated release' tar --no-same-owner -xjf "$workspace/$archive_name" -C "$workspace"
 else
-    unzip -q "$workspace/$archive_name" -d "$workspace"
+    with_progress 'Extracting the validated ZIP release' unzip -q "$workspace/$archive_name" -d "$workspace"
 fi
 release="$workspace/nextcloud"
 for file in occ version.php index.php status.php lib/versioncheck.php; do [[ -f $release/$file ]] || fail "Release missing $file"; done
 find "$release" -type l -print0 > "$workspace/release.links"
-check_file_links "$release" "$workspace/release.links"
+with_progress 'Checking extracted file links' check_file_links "$release" "$workspace/release.links"
+log 'Checking the extracted release version, stable channel and PHP compatibility.'
 php_info release "$release" "$download_version"
 log --success 'Stable release and PHP compatibility checked.'
 # Stage on the installation filesystem so both replacements are renames, not copies.
 parent=$(dirname -- "$NEXTCLOUD_PATH")
+log 'Checking staging space and existing application size.'
 app_bytes=$(find_application -printf '%s\n' | awk '{bytes+=$1} END {printf "%.0f\n",bytes}')
 app_inodes=$(find_application -printf '.\n' | wc -l)
 check_space "$parent" "$((unpacked_bytes + app_bytes + 104857600))" "$((entry_count + app_inodes + 1000))"
 stage=$(mktemp -d -p "$parent" .nextcloud-stage.XXXXXXXX)
-cp -a -- "$release" "$stage/nextcloud"
+with_progress 'Copying the release into staging' cp -a -- "$release" "$stage/nextcloud"
 if [[ -n $data_relative ]]; then
     # Some archives contain the standard data/ skeleton. It is not live data.
     if [[ $data_relative == data && -d $stage/nextcloud/data ]]; then
@@ -777,27 +841,32 @@ if [[ -z $BACKUP_SSH_DEST && $(stat -c %d "$BACKUP_PATH") == "$(stat -c %d "$dat
     log --warning 'Note: recovery backups share the data filesystem. Consider an off-server copy if you do not already keep one.'
 fi
 check_backup_space
-read_cron "$workspace/cron.original" || fail "Cannot read $WEB_USER crontab; configure or inspect it before upgrading."
-cron_was_present=$cron_read_present
-if [[ $cron_was_present == no ]]; then
-    log --warning "No account crontab for $WEB_USER. Check that any systemd timers or external workers are paused for the upgrade."
+if [[ $manage_cron == yes ]]; then
+    read_cron "$workspace/cron.original" || fail "Cannot read $WEB_USER crontab; configure or inspect it before upgrading."
+    cron_was_present=$cron_read_present
+    if [[ $cron_was_present == no ]]; then
+        log --warning "No account crontab for $WEB_USER. Check that any systemd timers or external workers are paused for the upgrade."
+    fi
+    # Match this installation only. Reject an unrecognised cron.php invocation.
+    awk -v target="$NEXTCLOUD_PATH/cron.php" '
+        /^[[:space:]]*#/ {print;next}
+        /cron\.php/ {
+            found=0; for(i=1;i<=NF;i++) if($i==target) found=1
+            if(!found) exit 1
+            print "# nextcloud-upgrade: " $0; next
+        }
+        {print}
+    ' "$workspace/cron.original" > "$workspace/cron.disabled" || fail 'Unrecognised cron.php invocation; inspect the crontab first.'
+elif [[ $background_mode == cron ]]; then
+    log --warning 'Cron mode is selected but crontab is unavailable. Pause system timers and external schedulers before proceeding.'
 fi
-# Match this installation only. Reject an unrecognised cron.php invocation.
-awk -v target="$NEXTCLOUD_PATH/cron.php" '
-    /^[[:space:]]*#/ {print;next}
-    /cron\.php/ {
-        found=0; for(i=1;i<=NF;i++) if($i==target) found=1
-        if(!found) exit 1
-        print "# nextcloud-upgrade: " $0; next
-    }
-    {print}
-' "$workspace/cron.original" > "$workspace/cron.disabled" || fail 'Unrecognised cron.php invocation; inspect the crontab first.'
 log --success "Ready: $current_version -> $download_version. Preparation checks passed."
 printf '  %-18s %s\n' \
     'Installation:' "$NEXTCLOUD_PATH" \
     'Run as:' "$WEB_USER:$WEB_GROUP ($PHP_BIN)" \
     'Services:' "$SERVICE_MANAGER; web=$WEB_SERVICE; PHP=$PHP_SERVICE" \
-    'Background jobs:' "account crontab for $WEB_USER" \
+    'Background jobs:' "$background_label" \
+    'Settling pause:' "${WAIT_AFTER_MAINTENANCE}s before service shutdown" \
     'Database:' "$db_type / $db_name" \
     'Data directory:' "$data_path" \
     'Backup directory:' "$BACKUP_PATH" \
@@ -808,9 +877,12 @@ log --question 'Proceed with the upgrade? [y/N]:'
 read -r answer
 [[ $answer == y || $answer == Y ]] || { log 'Upgrade cancelled.'; exit 0; }
 
-recovery=$(mktemp -d -p "$BACKUP_PATH" "upgrade-$(date -u +%Y%m%dT%H%M%SZ).XXXXXXXX")
+# Name each recovery set after its source version, including the build component.
+recovery=$(mktemp -d -p "$BACKUP_PATH" "upgrade-${current_version}-$(date -u +%Y%m%dT%H%M%SZ).XXXXXXXX")
 old_path="${NEXTCLOUD_PATH}.old.${recovery##*/}"
-cp -- "$workspace/cron.original" "$workspace/cron.disabled" "$recovery/"
+if [[ $manage_cron == yes ]]; then
+    cp -- "$workspace/cron.original" "$workspace/cron.disabled" "$recovery/"
+fi
 cp -- "$workspace/preserved-paths" "$recovery/preserved-paths"
 printf 'installation=%s\nprevious_version=%s\ntarget_version=%s\nold_application=%s\nstaging=%s\nworkspace=%s\ndatabase_type=%s\ndatabase_name=%s\nservice_manager=%s\nweb_service=%s\nphp_service=%s\n' \
     "$NEXTCLOUD_PATH" "$current_version" "$download_version" "$old_path" "$stage" "$workspace" "$db_type" "$db_name" "$SERVICE_MANAGER" "$WEB_SERVICE" "$PHP_SERVICE" > "$recovery/manifest"
@@ -818,21 +890,29 @@ printf 'installation=%s\nprevious_version=%s\ntarget_version=%s\nold_application
     printf 'data_directory=%s\ndata_identity=%s\ninternal_data_relative=%s\nbackup_data=%s\n' "$data_path" "$data_identity" "$data_relative" "$BACKUP_DATA"
     printf 'backup_archive=%s\nbackup_ssh_destination=%s\n' "$BACKUP_ARCHIVE" "$BACKUP_SSH_DEST"
     printf 'web_user=%s\nweb_group=%s\nphp_binary=%s\n' "$WEB_USER" "$WEB_GROUP" "$PHP_BIN"
-    printf 'account_crontab_present=%s\n' "$cron_was_present"
+    printf 'background_jobs_mode=%s\naccount_crontab_managed=%s\naccount_crontab_present=%s\n' "$background_mode" "$manage_cron" "$cron_was_present"
 } >> "$recovery/manifest"
-set_phase quiescing "Enabling maintenance, disabling Nextcloud cron, and stopping application services through $SERVICE_MANAGER."
+set_phase quiescing 'Enabling maintenance and suspending background jobs.'
 printf '%s\n' "$recovery" > "$BACKUP_PATH/upgrade-active"
 sync -f "$BACKUP_PATH"
 production_changed=yes
 offline_started=$SECONDS
 occ maintenance:mode --on
-# Verify no operator changed cron between preflight and this write.
-read_cron "$recovery/cron.current"
-cmp -s "$recovery/cron.original" "$recovery/cron.current" || fail 'Crontab changed since preflight.'
-if [[ $cron_was_present == yes ]]; then
-    cron_changed=yes
-    crontab -u "$WEB_USER" "$recovery/cron.disabled"
+# HTTP job modes stop with maintenance/web services; only cron mode edits crontab.
+if [[ $manage_cron == yes ]]; then
+    # Verify no operator changed cron between preflight and this write.
+    read_cron "$recovery/cron.current"
+    cmp -s "$recovery/cron.original" "$recovery/cron.current" || fail 'Crontab changed since preflight.'
+    if [[ $cron_was_present == yes ]]; then
+        cron_changed=yes
+        crontab -u "$WEB_USER" "$recovery/cron.disabled"
+    fi
 fi
+# Let in-flight HTTP requests finish before asking the service manager to stop.
+if (( WAIT_AFTER_MAINTENANCE > 0 )); then
+    with_progress "Allowing ${WAIT_AFTER_MAINTENANCE}s for active requests to finish before service shutdown" sleep "$WAIT_AFTER_MAINTENANCE"
+fi
+log "Stopping application services through $SERVICE_MANAGER."
 stop_services
 # Maintenance prevents new jobs; an already running CLI job must also finish.
 for ((elapsed=0; ; elapsed++)); do
@@ -912,15 +992,15 @@ migration_started=yes
 # Record this boundary before launching a command that can change the database.
 occ upgrade --no-interaction 2>&1 | tee "$recovery/upgrade.log"
 set_phase verifying 'Checking installed version, database migration state, and maintenance mode.'
-# occ may change maintenance itself; services and cron are still stopped.
+# occ may change maintenance itself; application services remain stopped.
 occ maintenance:mode --on
 occ status --output=json | php_info status on "$download_version" > "$recovery/status.version"
-set_phase restoring 'Starting application services under maintenance, then restoring cron.'
+set_phase restoring 'Starting application services under maintenance, then restoring background jobs.'
 start_services
 restore_cron
 occ maintenance:mode --off
 occ status --output=json | php_info status off "$download_version" > "$recovery/status.version"
-# Services were already verified active. A browser/client check remains mandatory.
+# Keep the final version check after services and background jobs resume.
 set_phase complete 'Version, migration status and service checks passed.' --success
 rm -- "$BACKUP_PATH/upgrade-active"
 sync -f "$BACKUP_PATH"
