@@ -11,6 +11,7 @@ import os
 from pathlib import Path
 import shutil
 import signal
+import stat
 import subprocess
 import sys
 import tarfile
@@ -39,8 +40,15 @@ def fail_once(point):
     if mode == point and not (root / ('failed-' + point)).exists():
         (root / ('failed-' + point)).touch()
         die(23)
+def cron_stopped():
+    path = root / 'cron'
+    return not path.exists() or all(line.lstrip().startswith('#') or 'cron.php' not in line for line in path.read_text().splitlines())
 if name == 'sudo':
-    assert args[:3] == ['-u', 'www-data', 'php'], args
+    assert args[:3] == ['-u', os.environ.get('WEB_USER', 'www-data'), os.environ.get('PHP_BIN', 'php')], args
+    if args[3] == '-r':
+        assert args[-2] == 'build', args[-2:]
+        event('build metadata as ' + args[1])
+        os.execv(os.environ['REAL_PHP'], [os.environ['REAL_PHP'], *args[3:]])
     assert args[3] == './occ', args
     assert pathlib.Path.cwd() == root / 'nextcloud'
     a = args[4:]
@@ -67,7 +75,7 @@ if name == 'sudo':
         s['maintenance'] = a[1] == '--on'; save('status', s)
     elif a[0] == 'upgrade':
         assert all(state == 'inactive' for state in load('services').values())
-        assert '# nextcloud-upgrade:' in (root / 'cron').read_text()
+        assert cron_stopped()
         if os.environ.get('DATA_DIRECTORY'):
             assert (pathlib.Path(os.environ['DATA_DIRECTORY']) / 'sentinel').read_text() == 'Never modify or duplicate EFS data'
         s['version'] = '34.0.1.0'
@@ -81,7 +89,7 @@ if name == 'sudo':
         if mode == 'external-cron': (root / 'cron').write_text((root / 'cron').read_text() + '* * * * * echo new-job\n')
         print('Upgrade successful')
     else: raise AssertionError(a)
-elif name == 'php':
+elif name in ('php', 'php-cli-alt'):
     os.execv(os.environ['REAL_PHP'], [os.environ['REAL_PHP'], *args])
 elif name == 'curl':
     event('curl')
@@ -162,9 +170,10 @@ elif name == 'systemctl':
             else: save('pending-' + svc, [target, remaining - 1])
         print(load('services')[svc])
 elif name == 'crontab':
-    assert args[:2] == ['-u', 'www-data']
+    assert args[:2] == ['-u', os.environ.get('WEB_USER', 'www-data')]
     if args[2] == '-l':
         if mode == 'cron-unreadable': die(1)
+        if not (root / 'cron').exists(): print('no crontab for ' + args[1], file=sys.stderr); die(1)
         sys.stdout.write((root / 'cron').read_text())
     else:
         src = pathlib.Path(args[2]); assert str(src).startswith((str(root / 'var-tmp/nextcloud-upgrade.'), str(root / 'backups')))
@@ -186,7 +195,7 @@ elif name in ('mariadb-dump', 'mysqldump', 'pg_dump'):
     event('dump')
     assert load('status')['maintenance']
     assert all(state == 'inactive' for state in load('services').values())
-    assert '# nextcloud-upgrade:' in (root / 'cron').read_text()
+    assert cron_stopped()
     if mode == 'signal-backup': os.kill(int(os.environ['UPGRADE_PID']), signal.SIGINT); time.sleep(.2); die(130)
     if mode == 'backup': print('partial sql'); die(27)
     dump = 'CREATE TABLE test(id int);\nINSERT INTO test VALUES(1);\n'
@@ -202,11 +211,24 @@ elif name == 'findmnt':
     if (root / 'mounted').exists(): print(str(root / 'nextcloud/local.txt'))
     if mode == 'data-mount': print(os.environ['DATA_DIRECTORY'].replace(' ', r'\x20'))
 elif name == 'pgrep':
+    assert args[:2] == ['-u', os.environ.get('WEB_USER', 'www-data')]
     if mode == 'background': print('1234'); die(0)
     die(1)
 elif name == 'chown':
+    assert args[:2] == ['-hR', os.environ.get('WEB_USER', 'www-data') + ':' + (os.environ.get('WEB_GROUP') or os.environ.get('PRIMARY_GROUP', os.environ.get('WEB_USER', 'www-data')))]
     assert str(root / '.nextcloud-stage.') in args[-1], args
     assert not (pathlib.Path(args[-1]) / 'data/sentinel').exists(), 'Live data must not be present during ownership changes'
+elif name == 'id':
+    assert args[-1] == os.environ.get('WEB_USER', 'www-data'), args
+    if mode == 'unknown-account': die(1)
+    if args[0] == '-u': print('0' if args[-1] == 'root' else '33')
+    else:
+        assert args[0] == '-gn', args
+        print(os.environ.get('PRIMARY_GROUP', args[-1]))
+elif name == 'getent':
+    assert args[0] == 'group', args
+    if mode == 'unknown-group': die(2)
+    print(args[1] + ':x:33:')
 elif name == 'stat':
     if args[:2] == ['-c', '%u']: print('0')
     else: os.execv(os.environ['REAL_STAT'], [os.environ['REAL_STAT'], *args])
@@ -251,7 +273,7 @@ elif name == 'rsync':
     event('data verify' if '-aHAXnc' in args else 'data copy')
     assert load('status')['maintenance']
     assert all(state == 'inactive' for state in load('services').values())
-    assert '# nextcloud-upgrade:' in (root / 'cron').read_text()
+    assert cron_stopped()
     assert pathlib.Path(args[-2]) == pathlib.Path(os.environ.get('DATA_DIRECTORY', str(root / 'storage')))
     assert '/backups/upgrade-' in args[-1] and args[-1].endswith('/data.partial/'), args
     if '-aHAXnc' in args:
@@ -292,10 +314,10 @@ class UpgradeScenarios:
         (r / 'bin').mkdir()
         mock = r / 'bin/mock'; mock.write_text(MOCK.replace('#!/usr/bin/env python3', '#!' + sys.executable, 1)); mock.chmod(0o755)
         names = ('sudo php curl monit systemctl crontab mariadb mariadb-dump mysql mysqldump psql pg_dump '
-                 'findmnt pgrep chown stat df mv cp tar gzip rsync ssh').split()
+                 'findmnt pgrep chown stat df mv cp tar gzip rsync ssh id getent').split()
         for name in names: (r / 'bin' / name).symlink_to(mock)
         # A closed PATH prevents missing doubles from reaching real host tools.
-        tools = ('bash cat mktemp flock realpath find du awk grep sort head tail wc dirname date cmp rm '
+        tools = ('bash cat mktemp flock realpath readlink find du awk grep sort head tail wc dirname date cmp rm '
                  'chmod mkdir tee sync tar bzip2 unzip zipinfo sha256sum sha512sum md5sum sleep').split()
         for name in tools:
             if not (r / 'bin' / name).exists():
@@ -315,6 +337,7 @@ class UpgradeScenarios:
         (r / 'nextcloud/custom_apps/test/custom.php').write_text('custom path app')
         (r / 'nextcloud/themes/custom/style.css').write_text('custom theme')
         (r / 'nextcloud/.user.ini').write_text('custom ini')
+        (r / 'nextcloud/.htaccess').write_text('custom Apache settings')
         (r / 'storage/sentinel').write_text('Never modify or duplicate EFS data')
         (r / 'nextcloud/version.php').write_text("<?php $OC_Build='2026-10-14';")
         (r / 'status').write_text(json.dumps(dict(installed=True, maintenance=False, needsDbUpgrade=False, version='34.0.0.0')))
@@ -338,6 +361,7 @@ class UpgradeScenarios:
         self.script = r / 'script'; self.script.write_text(s)
         self.env = dict(os.environ, PATH=str(r / 'bin'), TEST_ROOT=str(r), REAL_PHP=REAL_PHP,
                         SERVICE_MANAGER=self.service_manager,
+                        WEB_USER='www-data', WEB_GROUP='', PHP_BIN='php',
                         NEXTCLOUD_PATH=str(r / 'nextcloud'), BACKUP_PATH=str(r / 'backups'),
                         WAIT_BEFORE_BACKUP='0', WAIT_AFTER_SERVER_START='0')
         for name, tool in REAL_TOOLS.items():
@@ -357,7 +381,13 @@ class UpgradeScenarios:
                 archive.addfile(info, io.BytesIO(b'x'))
         with zipfile.ZipFile(r / 'nextcloud-34.0.1.zip', 'w', zipfile.ZIP_DEFLATED) as archive:
             for p in (r / 'release').rglob('*'):
-                archive.write(p, str(p.relative_to(r / 'release')) + ('/' if p.is_dir() else ''))
+                name = str(p.relative_to(r / 'release'))
+                if p.is_symlink():
+                    info = zipfile.ZipInfo(name); info.create_system = 3
+                    info.external_attr = (stat.S_IFLNK | 0o777) << 16
+                    archive.writestr(info, os.readlink(p))
+                else:
+                    archive.write(p, name + ('/' if p.is_dir() else ''))
 
     def run_upgrade(self, mode='', args=(), answer='y', extra=None):
         env = dict(self.env, FAIL_AT=mode, **(extra or {}))
@@ -423,6 +453,125 @@ class UpgradeScenarios:
 
     def test_zip_success(self):
         self.assertEqual(self.run_upgrade(extra={'DOWNLOAD_FORMAT': 'zip'}).returncode, 0, self.output)
+
+    def test_shipped_internal_file_links_work_in_tar_and_zip(self):
+        for archive_format in ('tar.bz2', 'zip'):
+            with self.subTest(archive_format=archive_format):
+                f = type(self)('test_success_preserves_config_apps_themes_schedule_and_recovery'); f.setUp()
+                try:
+                    for base in (f.root / 'nextcloud', f.root / 'release/nextcloud'):
+                        dist = base / 'dist'; dist.mkdir()
+                        (dist / 'asset.js.license').write_text('license content')
+                        (dist / 'asset.js.map.license').symlink_to('asset.js.license')
+                        (dist / 'another.map.license').symlink_to('asset.js.map.license')
+                    f.make_archive()
+                    self.assertEqual(f.run_upgrade(extra={'DOWNLOAD_FORMAT': archive_format}).returncode, 0, f.output)
+                    self.assertEqual(os.readlink(f.root / 'nextcloud/dist/asset.js.map.license'), 'asset.js.license')
+                    self.assertEqual((f.root / 'nextcloud/dist/asset.js.map.license').read_text(), 'license content')
+                finally: f.doCleanups()
+
+    def test_archive_links_cannot_escape_or_point_to_directories(self):
+        for archive_format in ('tar.bz2', 'zip'):
+            for target in ('/etc/passwd', '../../outside', 'directory', 'loop'):
+                with self.subTest(archive_format=archive_format, target=target):
+                    dist = self.root / 'release/nextcloud/dist'; dist.mkdir(exist_ok=True)
+                    (dist / 'directory').mkdir(exist_ok=True)
+                    link = dist / 'loop'; link.symlink_to(target)
+                    self.make_archive()
+                    self.assertNotEqual(self.run_upgrade(extra={'DOWNLOAD_FORMAT': archive_format}).returncode, 0, self.output)
+                    self.assert_original()
+                    self.assertNotIn('occ maintenance:mode', (self.root / 'events').read_text())
+                    link.unlink()
+
+    def test_application_links_into_internal_data_are_rejected(self):
+        data = self.root / 'nextcloud/data'; data.mkdir()
+        (data / 'private').write_text('must never copy through an application link')
+        (self.root / 'nextcloud/dist').mkdir()
+        (self.root / 'nextcloud/dist/unsafe').symlink_to('../data/private')
+        self.assertNotEqual(self.run_upgrade(extra={'DATA_DIRECTORY': str(data)}).returncode, 0, self.output)
+        self.assertIn('Unsupported application link into user data', self.output)
+        self.assert_original()
+
+    def test_links_in_custom_app_are_copied_without_following_them(self):
+        link = self.root / 'nextcloud/custom_apps/test/local.php'
+        link.symlink_to('custom.php')
+        self.assertEqual(self.run_upgrade().returncode, 0, self.output)
+        self.assertEqual(os.readlink(link), 'custom.php')
+        recovery = next((self.root / 'backups').glob('upgrade-*/manifest')).parent
+        self.assertEqual(os.readlink(recovery / 'custom/custom_apps/test/local.php'), 'custom.php')
+
+    def test_help_needs_no_root_services_or_tools(self):
+        for option in ('--help', '-h'):
+            with self.subTest(option=option):
+                result = subprocess.run(['/bin/bash', str(self.script), option], env=dict(self.env, PATH='/no-tools'), capture_output=True, text=True)
+                self.assertEqual(result.returncode, 0, result.stderr)
+                self.assertIn('WEB_USER', result.stdout)
+                self.assertIn('BACKUP_SSH_DEST', result.stdout)
+        self.assertEqual((self.root / 'events').read_text(), '')
+
+    def test_installed_build_metadata_runs_as_web_account(self):
+        self.assertEqual(self.run_upgrade(answer='n').returncode, 0, self.output)
+        self.assertIn('build metadata as www-data', (self.root / 'events').read_text())
+        self.assert_original()
+
+    def test_custom_web_account_group_and_php_apply_to_success_and_recovery(self):
+        for mode in ('', 'new-rename', 'migration'):
+            with self.subTest(mode=mode):
+                f = type(self)('test_success_preserves_config_apps_themes_schedule_and_recovery')
+                f.setUp()
+                try:
+                    binary = f.root / 'bin/php-cli-alt'; binary.symlink_to(f.root / 'bin/mock')
+                    extra = {'WEB_USER': 'apache', 'WEB_GROUP': 'wwwrun', 'PHP_BIN': str(binary)}
+                    result = f.run_upgrade(mode, extra=extra)
+                    self.assertEqual(result.returncode == 0, not mode, f.output)
+                    if mode == 'new-rename': f.assert_original()
+                    if mode == 'migration': f.assert_blocked()
+                    recovery = next((f.root / 'backups').glob('upgrade-*/manifest')).parent
+                    manifest = (recovery / 'manifest').read_text()
+                    self.assertIn('web_user=apache\nweb_group=wwwrun\nphp_binary=' + str(binary), manifest)
+                finally: f.doCleanups()
+
+    def test_primary_group_is_used_when_web_group_is_unset(self):
+        self.assertEqual(self.run_upgrade(extra={'WEB_USER': 'nginx', 'PRIMARY_GROUP': 'wwwrun'}).returncode, 0, self.output)
+        recovery = next((self.root / 'backups').glob('upgrade-*'))
+        self.assertIn('web_group=wwwrun', (recovery / 'manifest').read_text())
+
+    def test_absent_account_crontab_is_allowed_and_remains_absent(self):
+        (self.root / 'cron').unlink()
+        self.assertEqual(self.run_upgrade().returncode, 0, self.output)
+        self.assertFalse((self.root / 'cron').exists())
+        self.assertIn('Check that any systemd timers or external workers are paused', self.output)
+        recovery = next((self.root / 'backups').glob('upgrade-*/manifest')).parent
+        self.assertIn('account_crontab_present=no', (recovery / 'manifest').read_text())
+
+    def test_absent_crontab_is_not_created_during_failure_recovery(self):
+        for mode in ('backup', 'migration'):
+            with self.subTest(mode=mode):
+                f = type(self)('test_success_preserves_config_apps_themes_schedule_and_recovery'); f.setUp()
+                try:
+                    (f.root / 'cron').unlink()
+                    self.assertNotEqual(f.run_upgrade(mode).returncode, 0, f.output)
+                    self.assertFalse((f.root / 'cron').exists())
+                    self.assertEqual(json.loads((f.root / 'status').read_text())['maintenance'], mode == 'migration')
+                finally: f.doCleanups()
+
+    def test_invalid_or_missing_accounts_and_groups_fail_before_changes(self):
+        for mode, extra in [('', {'WEB_USER': 'root'}), ('', {'WEB_USER': '-root'}),
+                            ('unknown-account', {}), ('unknown-group', {})]:
+            with self.subTest(mode=mode, extra=extra):
+                self.assertNotEqual(self.run_upgrade(mode, extra=extra).returncode, 0, self.output)
+                self.assertEqual((self.root / 'events').read_text(), '')
+                self.assert_original()
+
+    def test_summary_shows_versions_paths_and_selected_backup_options(self):
+        self.assertEqual(self.run_upgrade(extra={'BACKUP_ARCHIVE': 'yes'}).returncode, 0, self.output)
+        self.assertIn('Preparation checks passed.', self.output)
+        self.assertRegex(self.output, r'Data backup:\s+no')
+        self.assertRegex(self.output, r'Local bundle:\s+yes')
+        self.assertIn('Upgrade complete: 34.0.0 -> 34.0.1.', self.output)
+        self.assertIn('Recovery directory:', self.output)
+        self.assertIn('Restore bundle:', self.output)
+        self.assertNotIn('secret', self.output)
 
     def preservation_list(self, text):
         path = self.root / 'preserve.txt'
@@ -521,13 +670,13 @@ class UpgradeScenarios:
         local = self.root / 'nextcloud/local.txt'
         local.symlink_to(self.root / 'storage/sentinel')
         extra = self.preservation_list('local.txt')
-        self.assert_preservation_refused(extra, 'Only regular files and directories')
+        self.assert_preservation_refused(extra, 'Unsupported application link')
         local.unlink(); os.mkfifo(local)
         self.assert_preservation_refused(extra, 'Only regular files and directories')
 
     def test_changed_custom_sources_and_copy_failure_recover_original_installation(self):
         for mode, message in [('custom-disappeared', 'Missing preservation'),
-                              ('custom-symlink', 'Only regular files and directories'),
+                              ('custom-symlink', 'Unsupported application link'),
                               ('custom-mount', 'Mount inside application tree'),
                               ('custom-app-conflict', 'Custom app conflicts'),
                               ('custom-copy', 'failed at script line')]:
@@ -917,6 +1066,8 @@ class DataBackupTests(unittest.TestCase):
                     names = saved.getnames()
                     self.assertIn('config/config.php', names)
                     self.assertIn('database.sql.gz', names)
+                    self.assertEqual(saved.extractfile('.htaccess').read(), b'custom Apache settings')
+                    self.assertEqual(saved.extractfile('.user.ini').read(), b'custom ini')
                     self.assertIn('custom/apps/extra/custom.php', names)
                     self.assertIn('custom/themes/custom/style.css', names)
                     self.assertEqual('data/sentinel' in names, enabled == 'yes')
@@ -927,6 +1078,8 @@ class DataBackupTests(unittest.TestCase):
                 restored = f.root / 'restore'; restored.mkdir()
                 subprocess.run([REAL_TOOLS['tar'], '--acls', '--xattrs', '--numeric-owner', '-xpf', str(archive), '-C', str(restored)], check=True, capture_output=True)
                 self.assertEqual((restored / 'config/config.php').read_text(), 'configuration')
+                self.assertEqual((restored / '.htaccess').read_text(), 'custom Apache settings')
+                self.assertEqual((restored / '.user.ini').read_text(), 'custom ini')
                 self.assertEqual((restored / 'custom/apps/extra/custom.php').read_text(), 'custom app')
                 if enabled == 'yes':
                     self.assertEqual((restored / 'data/sentinel').stat().st_mode & 0o777, 0o604)
@@ -990,6 +1143,8 @@ class DataBackupTests(unittest.TestCase):
                 saved_archive = next(remote.glob('upgrade-*.tar'))
                 self.assertEqual(saved_archive.stat().st_mode & 0o777, 0o600)
                 with tarfile.open(saved_archive) as saved:
+                    self.assertEqual(saved.extractfile('.htaccess').read(), b'custom Apache settings')
+                    self.assertEqual(saved.extractfile('.user.ini').read(), b'custom ini')
                     self.assertEqual(saved.extractfile('data/users/.hidden').read(), b'private content')
                     self.assertEqual(saved.extractfile('phase').read(), b'backups-ready\n')
                 events = (f.root / 'events').read_text()

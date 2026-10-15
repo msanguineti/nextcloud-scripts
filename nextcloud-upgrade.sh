@@ -3,8 +3,53 @@
 set -Eeuo pipefail
 umask 077
 
+usage() {
+    printf '%s\n' 'Usage: nextcloud-upgrade.sh [stable-version]
+       nextcloud-upgrade.sh --help
+
+Upgrade one archive-based Nextcloud installation on a systemd Linux host.
+Without a version, discover the next eligible stable release. An explicit
+version must be within the currently installed major release. Confirmation
+is required before maintenance mode, service changes or backups begin.
+
+Options are environment variables (pass them with sudo env):
+  NEXTCLOUD_PATH          Installation directory (/var/www/nextcloud)
+  BACKUP_PATH             Existing recovery directory (/var/backups/nextcloud)
+  WEB_USER                Nextcloud/cron account (www-data)
+  WEB_GROUP               Staged application group (primary group of WEB_USER)
+  PHP_BIN                 PHP CLI executable, preferably absolute (php)
+  SERVICE_MANAGER         monit or systemd (monit)
+  WEB_SERVICE             Web-server service (nginx)
+  PHP_SERVICE             Separate PHP service, or none (php8.4-fpm)
+  BACKUP_DATA             Copy and verify filesystem data: yes/no (no)
+  BACKUP_ARCHIVE          Also create backup.tar and checksum: yes/no (no)
+  BACKUP_SSH_DEST         Optional extra archive: user@host:/absolute/directory
+  PRESERVE_PATHS_FILE     Optional list of extra installation-relative paths
+  DOWNLOAD_FORMAT        tar.bz2 or zip (tar.bz2)
+  CHECKSUM_TYPE           sha256, sha512 or md5 (sha256)
+  WAIT_BEFORE_BACKUP      Seconds for existing cron/occ jobs to finish (60)
+  WAIT_AFTER_SERVER_START Seconds to wait for each service state change (20)
+  NO_COLOR               Set to disable terminal colours
+
+Examples:
+  sudo nextcloud-upgrade.sh
+  sudo env SERVICE_MANAGER=systemd BACKUP_ARCHIVE=yes nextcloud-upgrade.sh
+  sudo env WEB_USER=apache WEB_GROUP=apache WEB_SERVICE=httpd \
+      PHP_SERVICE=php-fpm PHP_BIN=/usr/bin/php nextcloud-upgrade.sh 34.0.1
+
+See README.md for requirements, supported layouts, backups and recovery.'
+}
+if [[ ${1:-} == --help || ${1:-} == -h ]]; then
+    [[ $# == 1 ]] || { printf '%s\n' 'Use --help on its own.' >&2; exit 2; }
+    usage
+    exit 0
+fi
+
 NEXTCLOUD_PATH="${NEXTCLOUD_PATH:-/var/www/nextcloud}"
 BACKUP_PATH="${BACKUP_PATH:-/var/backups/nextcloud}"
+WEB_USER="${WEB_USER:-www-data}"
+WEB_GROUP="${WEB_GROUP:-}"
+PHP_BIN="${PHP_BIN:-php}"
 SERVICE_MANAGER="${SERVICE_MANAGER:-monit}"
 WEB_SERVICE="${WEB_SERVICE:-nginx}"
 # Use 'none' only when PHP runs inside the web-server process (e.g. mod_php).
@@ -31,7 +76,10 @@ production_changed=no
 replacement_started=no
 migration_started=no
 cron_changed=no
+cron_was_present=yes
 finished=no
+upgrade_started=$SECONDS
+offline_started=''
 
 log() {
     local symbol='[i]' color=36
@@ -50,7 +98,7 @@ log() {
 }
 fail() { log --error "ERROR: $*" >&2; exit 1; }
 need() { command -v "$1" >/dev/null || fail "Required command missing: $1"; }
-occ() { (cd "$NEXTCLOUD_PATH" && sudo -u www-data php ./occ "$@"); }
+occ() { (cd "$NEXTCLOUD_PATH" && sudo -u "$WEB_USER" "$PHP_BIN" ./occ "$@"); }
 config() { occ config:system:get "$1"; }
 
 find_application() {
@@ -61,6 +109,21 @@ find_application() {
     fi
 }
 
+check_file_links() {
+    local tree=$1 list=$2 link target resolved
+    while IFS= read -r -d '' link; do
+        target=$(readlink -- "$link")
+        resolved=$(realpath -e -- "$link") || fail "Unsupported application link (missing target): $link"
+        [[ $target != /* && $target != *[[:cntrl:]]* && -f $resolved && $resolved == "$tree/"* ]] || fail "Unsupported application link (must resolve to an internal file): $link"
+        if [[ $tree == "$NEXTCLOUD_PATH" ]]; then
+            [[ $resolved != "$data_path" && $resolved != "$data_path/"* ]] || fail "Unsupported application link into user data: $link"
+        fi
+        if [[ $link == "$tree/config/"* ]]; then
+            [[ $resolved == "$tree/config/"* ]] || fail "Configuration links must stay inside config/: $link"
+        fi
+    done < "$list"
+}
+
 check_application_tree() {
     local mounts mount unsupported
     mounts=$(findmnt --raw --noheadings --output TARGET)
@@ -68,8 +131,10 @@ check_application_tree() {
         printf -v mount '%b' "$mount" # findmnt --raw escapes spaces and backslashes.
         [[ $mount != "$NEXTCLOUD_PATH" && $mount != "$NEXTCLOUD_PATH/"* ]] || fail "Mount inside application tree: $mount"
     done <<< "$mounts"
-    unsupported=$(find_application ! -type d ! -type f -print -quit)
-    [[ -z $unsupported ]] || fail "Only regular files and directories are supported in the application tree (no symlinks): $unsupported"
+    unsupported=$(find_application ! -type d ! -type f ! -type l -print -quit)
+    [[ -z $unsupported ]] || fail "Only regular files and directories, plus internal file symlinks, are supported in the application tree: $unsupported"
+    find_application -type l -print0 > "$workspace/application.links"
+    check_file_links "$NEXTCLOUD_PATH" "$workspace/application.links"
 }
 
 check_preserved_path() {
@@ -126,7 +191,10 @@ backup_data() {
 
 shell_quote() { printf "'%s'" "${1//\'/\'\\\'\'}"; }
 backup_stream() {
-    local entries=(config database.sql.gz manifest preserved-paths cron.original cron.disabled phase)
+    local file entries=(config database.sql.gz manifest preserved-paths cron.original cron.disabled phase)
+    for file in .htaccess .user.ini; do
+        if [[ -f $recovery/$file ]]; then entries+=("$file"); fi
+    done
     if [[ -d $recovery/custom ]]; then entries+=(custom); fi
     if [[ $BACKUP_DATA == yes ]]; then entries+=(data data.verify.log); fi
     tar --acls --xattrs --numeric-owner -cf - -C "$recovery" -- "${entries[@]}"
@@ -172,10 +240,13 @@ restore_internal_data() {
 
 # PHP is already required by Nextcloud; use it for structured data, not regex XML.
 php_info() {
-    php -r "$(cat <<'PHP'
+    local runner=("$PHP_BIN")
+    if [[ $1 == build ]]; then runner=(sudo -u "$WEB_USER" "$PHP_BIN"); fi
+    "${runner[@]}" -r "$(cat <<'PHP'
 function bad($message) { fwrite(STDERR, $message . "\n"); exit(1); }
 $mode = $argv[1];
 if ($mode === 'build') {
+    // This mode runs as WEB_USER: installed PHP must never execute as root.
     require $argv[2] . '/version.php';
     echo urlencode($OC_Build) . 'x' . PHP_MAJOR_VERSION . 'x' . PHP_MINOR_VERSION . 'x' . PHP_RELEASE_VERSION;
 } elseif ($mode === 'update') {
@@ -286,18 +357,34 @@ start_services() {
         wait_service "$service" active || return 1
     done
 }
+read_cron() {
+    local destination=$1 rc
+    if LC_ALL=C crontab -u "$WEB_USER" -l > "$destination" 2> "$destination.error"; then
+        cron_read_present=yes
+        return 0
+    else
+        rc=$?
+    fi
+    if [[ $rc == 1 ]] && grep -Fxq "no crontab for $WEB_USER" "$destination.error"; then
+        cron_read_present=no
+        : > "$destination"
+        return 0
+    fi
+    cat "$destination.error" >&2
+    return 1
+}
 restore_cron() {
-    [[ $cron_changed == yes ]] || return 0
-    crontab -u www-data -l > "$recovery/cron.current" || return 1
+    [[ $cron_changed == yes || $cron_was_present == no ]] || return 0
+    read_cron "$recovery/cron.current" || return 1
     if cmp -s "$recovery/cron.original" "$recovery/cron.current"; then
         cron_changed=no
         return 0
     fi
-    cmp -s "$recovery/cron.disabled" "$recovery/cron.current" || {
+    if [[ $cron_was_present != yes ]] || ! cmp -s "$recovery/cron.disabled" "$recovery/cron.current"; then
         log --warning 'Crontab changed externally; reconcile cron.original and cron.current manually.' >&2
         return 1
-    }
-    crontab -u www-data "$recovery/cron.original" || return 1
+    fi
+    crontab -u "$WEB_USER" "$recovery/cron.original" || return 1
     cron_changed=no
 }
 
@@ -317,9 +404,11 @@ on_exit() {
             if [[ $migration_started == yes ]]; then
                 # Service restoration may already have restored cron. Re-disable only
                 # if it is still exactly one of our known snapshots.
-                if crontab -u www-data -l > "$recovery/cron.current"; then
+                if read_cron "$recovery/cron.current"; then
                     if cmp -s "$recovery/cron.original" "$recovery/cron.current"; then
-                        crontab -u www-data "$recovery/cron.disabled" || log --error 'Disable Nextcloud cron manually now.' >&2
+                        if [[ $cron_was_present == yes || $cron_read_present == yes ]]; then
+                            crontab -u "$WEB_USER" "$recovery/cron.disabled" || log --error 'Disable Nextcloud cron manually now.' >&2
+                        fi
                     elif ! cmp -s "$recovery/cron.disabled" "$recovery/cron.current"; then
                         log --warning 'Crontab changed externally; disable Nextcloud cron manually now.' >&2
                     fi
@@ -394,8 +483,15 @@ case $SERVICE_MANAGER in
     systemd) ;;
     *) fail 'SERVICE_MANAGER must be monit or systemd.' ;;
 esac
-for cmd in cat sudo php curl mktemp flock realpath stat find findmnt df du awk grep sort head tail wc dirname date cmp cp mv rm chmod chown mkdir gzip tee sync crontab systemctl pgrep; do need "$cmd"; done
-php -r 'exit(extension_loaded("SimpleXML") ? 0 : 1);' || fail 'PHP SimpleXML is required for update responses.'
+for cmd in cat sudo curl mktemp flock realpath readlink stat find findmnt df du awk grep sort head tail wc dirname date cmp cp mv rm chmod chown mkdir gzip tee sync crontab systemctl pgrep id getent; do need "$cmd"; done
+need "$PHP_BIN"
+[[ $WEB_USER =~ ^[A-Za-z_][A-Za-z0-9_.-]*\$?$ ]] || fail 'Invalid WEB_USER account name.'
+web_uid=$(id -u "$WEB_USER") || fail "Unknown WEB_USER: $WEB_USER"
+[[ $web_uid =~ ^[0-9]+$ && $web_uid != 0 ]] || fail 'WEB_USER must be a non-root account.'
+if [[ -z $WEB_GROUP ]]; then WEB_GROUP=$(id -gn "$WEB_USER"); fi
+[[ $WEB_GROUP =~ ^[A-Za-z_][A-Za-z0-9_.-]*\$?$ ]] || fail 'Invalid WEB_GROUP name.'
+getent group "$WEB_GROUP" > /dev/null || fail "Unknown WEB_GROUP: $WEB_GROUP"
+"$PHP_BIN" -r 'exit(extension_loaded("SimpleXML") ? 0 : 1);' || fail 'PHP SimpleXML is required for update responses.'
 for value in "$WAIT_BEFORE_BACKUP" "$WAIT_AFTER_SERVER_START"; do
     [[ $value =~ ^[0-9]+$ && ${#value} -le 5 ]] || fail 'Wait values must be nonnegative integers (at most five digits).'
 done
@@ -428,14 +524,14 @@ if [[ $data_path == "$NEXTCLOUD_PATH/"* ]]; then
     [[ $data_relative != config && $data_relative != config/* ]] || fail 'Data directory must be separate from configuration.'
 fi
 # Internal data is pruned from application inspection and ownership operations.
+workspace=$(mktemp -d -p /var/tmp nextcloud-upgrade.XXXXXXXX)
+log "Private workspace: $workspace"
 check_application_tree
 current_version=$(occ status --output=json | php_info status off)
 [[ $current_version =~ ^[0-9]+\.[0-9]+\.[0-9]+(\.[0-9]+)?$ ]] || fail 'Invalid installed version.'
 check_services
 log "Service manager: $SERVICE_MANAGER"
 
-workspace=$(mktemp -d -p /var/tmp nextcloud-upgrade.XXXXXXXX)
-log "Private workspace: $workspace"
 if [[ $# == 0 ]]; then
     channel=$(config updater.release.channel || true)
     [[ -z $channel || $channel == stable ]] || fail 'Automatic upgrades require the stable release channel.'
@@ -477,16 +573,51 @@ check_space() {
     [[ $available =~ ^[0-9]+$ && $free_inodes =~ ^[0-9]+$ ]] || fail "Cannot read filesystem capacity: $path"
     (( available >= bytes && free_inodes >= inodes )) || fail "Insufficient space or inodes at $path (need $bytes bytes, $inodes inodes)."
 }
-# Inspect names and entry types before extraction; reject links and special files.
+# Archive links must name a regular file in the same directory. This permits
+# shipped asset/license links without allowing a link to redirect extraction.
 if [[ $DOWNLOAD_FORMAT == tar.bz2 ]]; then
     tar -tjf "$workspace/$archive_name" > "$workspace/archive.names"
     tar -tvjf "$workspace/$archive_name" > "$workspace/archive.details"
-    awk 'substr($1,1,1)!="-" && substr($1,1,1)!="d" {exit 1}' "$workspace/archive.details" || fail 'Archive contains links or special files.'
+    awk '
+        {t=substr($1,1,1); types[$6]=t}
+        t!="-" && t!="d" && t!="l" {bad=1}
+        t=="l" {
+            if(NF!=8 || $7!="->" || $8!~/^[A-Za-z0-9_.-]+$/ || $8=="." || $8=="..") bad=1
+            parent=$6; sub(/[^/]+$/, "", parent); targets[$6]=parent $8; nlinks++
+        }
+        END {
+            for(link in targets) {
+                target=targets[link]; steps=0
+                while(types[target]=="l" && steps++<nlinks) target=targets[target]
+                if(types[target]!="-") bad=1
+            }
+            exit bad
+        }
+    ' "$workspace/archive.details" || fail 'Archive contains unsafe links or special files.'
     read -r unpacked_bytes entry_count < <(awk '{bytes+=$3;n++} END {printf "%.0f %d\n",bytes,n}' "$workspace/archive.details")
 else
     unzip -Z1 "$workspace/$archive_name" > "$workspace/archive.names"
     zipinfo -l "$workspace/$archive_name" > "$workspace/archive.details"
-    awk '/^[bclps]/ {exit 1}' "$workspace/archive.details" || fail 'ZIP contains links or special files.'
+    awk '/^[bcps]/ {exit 1} /^l/ {print $NF}' "$workspace/archive.details" > "$workspace/archive.links" || fail 'ZIP contains special files.'
+    : > "$workspace/archive.link-targets"
+    while IFS= read -r link; do
+        [[ $link =~ ^nextcloud/[A-Za-z0-9_./-]+$ ]] || fail 'Unsupported ZIP link name.'
+        target=$(unzip -p "$workspace/$archive_name" "$link")
+        [[ $target =~ ^[A-Za-z0-9_.-]+$ && $target != . && $target != .. ]] || fail 'ZIP link must name a file in the same directory.'
+        target=${link%/*}/$target
+        printf '%s\t%s\n' "$link" "$target" >> "$workspace/archive.link-targets"
+    done < "$workspace/archive.links"
+    awk '
+        FILENAME==ARGV[1] {types[$NF]=substr($1,1,1);next}
+        {targets[$1]=$2;nlinks++}
+        END {
+            for(link in targets) {
+                target=targets[link]; steps=0
+                while(types[target]=="l" && steps++<nlinks) target=targets[target]
+                if(types[target]!="-") exit 1
+            }
+        }
+    ' "$workspace/archive.details" "$workspace/archive.link-targets" || fail 'ZIP links must resolve to regular archive files.'
     read -r unpacked_bytes entry_count < <(awk '/^[-d]/ {bytes+=$4;n++} END {printf "%.0f %d\n",bytes,n}' "$workspace/archive.details")
 fi
 awk '$0 !~ /^nextcloud(\/|$)/ || $0 ~ /(^|\/)\.\.(\/|$)/ || $0 ~ /\\/ {exit 1}' "$workspace/archive.names" || fail 'Unsafe archive paths.'
@@ -499,8 +630,8 @@ else
 fi
 release="$workspace/nextcloud"
 for file in occ version.php index.php status.php lib/versioncheck.php; do [[ -f $release/$file ]] || fail "Release missing $file"; done
-release_links=$(find "$release" -type l -print -quit)
-[[ -z $release_links ]] || fail 'Release contains symlinks.'
+find "$release" -type l -print0 > "$workspace/release.links"
+check_file_links "$release" "$workspace/release.links"
 php_info release "$release" "$download_version"
 log --success 'Stable release and PHP compatibility checked.'
 # Stage on the installation filesystem so both replacements are renames, not copies.
@@ -637,7 +768,11 @@ if [[ -z $BACKUP_SSH_DEST && $(stat -c %d "$BACKUP_PATH") == "$(stat -c %d "$dat
     log --warning 'Note: recovery backups share the data filesystem. Consider an off-server copy if you do not already keep one.'
 fi
 check_backup_space
-crontab -u www-data -l > "$workspace/cron.original" || fail 'Cannot read www-data crontab; configure or inspect it before upgrading.'
+read_cron "$workspace/cron.original" || fail "Cannot read $WEB_USER crontab; configure or inspect it before upgrading."
+cron_was_present=$cron_read_present
+if [[ $cron_was_present == no ]]; then
+    log --warning "No account crontab for $WEB_USER. Check that any systemd timers or external workers are paused for the upgrade."
+fi
 # Match this installation only. Reject an unrecognised cron.php invocation.
 awk -v target="$NEXTCLOUD_PATH/cron.php" '
     /^[[:space:]]*#/ {print;next}
@@ -648,7 +783,18 @@ awk -v target="$NEXTCLOUD_PATH/cron.php" '
     }
     {print}
 ' "$workspace/cron.original" > "$workspace/cron.disabled" || fail 'Unrecognised cron.php invocation; inspect the crontab first.'
-log --success "Ready: $current_version -> $download_version. Database and config backup will follow quiescence."
+log --success "Ready: $current_version -> $download_version. Preparation checks passed."
+printf '  %-18s %s\n' \
+    'Installation:' "$NEXTCLOUD_PATH" \
+    'Run as:' "$WEB_USER:$WEB_GROUP ($PHP_BIN)" \
+    'Services:' "$SERVICE_MANAGER; web=$WEB_SERVICE; PHP=$PHP_SERVICE" \
+    'Background jobs:' "account crontab for $WEB_USER" \
+    'Database:' "$db_type / $db_name" \
+    'Data directory:' "$data_path" \
+    'Backup directory:' "$BACKUP_PATH" \
+    'Data backup:' "$BACKUP_DATA" \
+    'Local bundle:' "$BACKUP_ARCHIVE" \
+    'SSH copy:' "${BACKUP_SSH_DEST:-disabled}"
 log --question 'Proceed with the upgrade? [y/N]:'
 read -r answer
 [[ $answer == y || $answer == Y ]] || { log 'Upgrade cancelled.'; exit 0; }
@@ -659,22 +805,29 @@ cp -- "$workspace/cron.original" "$workspace/cron.disabled" "$recovery/"
 cp -- "$workspace/preserved-paths" "$recovery/preserved-paths"
 printf 'installation=%s\nprevious_version=%s\ntarget_version=%s\nold_application=%s\nstaging=%s\nworkspace=%s\ndatabase_type=%s\ndatabase_name=%s\nservice_manager=%s\nweb_service=%s\nphp_service=%s\n' \
     "$NEXTCLOUD_PATH" "$current_version" "$download_version" "$old_path" "$stage" "$workspace" "$db_type" "$db_name" "$SERVICE_MANAGER" "$WEB_SERVICE" "$PHP_SERVICE" > "$recovery/manifest"
-printf 'data_directory=%s\ndata_identity=%s\ninternal_data_relative=%s\nbackup_data=%s\n' "$data_path" "$data_identity" "$data_relative" "$BACKUP_DATA" >> "$recovery/manifest"
-printf 'backup_archive=%s\nbackup_ssh_destination=%s\n' "$BACKUP_ARCHIVE" "$BACKUP_SSH_DEST" >> "$recovery/manifest"
+{
+    printf 'data_directory=%s\ndata_identity=%s\ninternal_data_relative=%s\nbackup_data=%s\n' "$data_path" "$data_identity" "$data_relative" "$BACKUP_DATA"
+    printf 'backup_archive=%s\nbackup_ssh_destination=%s\n' "$BACKUP_ARCHIVE" "$BACKUP_SSH_DEST"
+    printf 'web_user=%s\nweb_group=%s\nphp_binary=%s\n' "$WEB_USER" "$WEB_GROUP" "$PHP_BIN"
+    printf 'account_crontab_present=%s\n' "$cron_was_present"
+} >> "$recovery/manifest"
 set_phase quiescing "Enabling maintenance, disabling Nextcloud cron, and stopping application services through $SERVICE_MANAGER."
 printf '%s\n' "$recovery" > "$BACKUP_PATH/upgrade-active"
 sync -f "$BACKUP_PATH"
 production_changed=yes
+offline_started=$SECONDS
 occ maintenance:mode --on
 # Verify no operator changed cron between preflight and this write.
-crontab -u www-data -l > "$recovery/cron.current"
+read_cron "$recovery/cron.current"
 cmp -s "$recovery/cron.original" "$recovery/cron.current" || fail 'Crontab changed since preflight.'
-cron_changed=yes
-crontab -u www-data "$recovery/cron.disabled"
+if [[ $cron_was_present == yes ]]; then
+    cron_changed=yes
+    crontab -u "$WEB_USER" "$recovery/cron.disabled"
+fi
 stop_services
 # Maintenance prevents new jobs; an already running CLI job must also finish.
 for ((elapsed=0; ; elapsed++)); do
-    if pgrep -u www-data -f '(^|/)(cron\.php|occ)([[:space:]]|$)' > "$recovery/background-pids"; then
+    if pgrep -u "$WEB_USER" -f '(^|/)(cron\.php|occ)([[:space:]]|$)' > "$recovery/background-pids"; then
         ((elapsed < WAIT_BEFORE_BACKUP)) || fail 'Existing cron/occ process did not finish; do not kill it blindly.'
         sleep 1
     else
@@ -708,6 +861,9 @@ rm -- "$recovery/database.sql.part"
 [[ -z $credentials ]] || rm -f -- "$credentials"
 credentials=; unset db_password
 cp -a -- "$NEXTCLOUD_PATH/config" "$recovery/config"
+for file in .htaccess .user.ini; do
+    if [[ -f $NEXTCLOUD_PATH/$file ]]; then cp -aL -- "$NEXTCLOUD_PATH/$file" "$recovery/$file"; fi
+done
 for path in "${preserved_paths[@]}"; do
     mkdir -p -- "$(dirname -- "$recovery/custom/$path")"
     cp -aT -- "$NEXTCLOUD_PATH/$path" "$recovery/custom/$path"
@@ -727,7 +883,9 @@ done
 for file in .htaccess .user.ini; do
     [[ ! -f $NEXTCLOUD_PATH/$file ]] || cp -a -- "$NEXTCLOUD_PATH/$file" "$stage/nextcloud/$file"
 done
-chown -R www-data:www-data "$stage/nextcloud"
+find "$stage/nextcloud" -type l -print0 > "$workspace/staged.links"
+check_file_links "$stage/nextcloud" "$workspace/staged.links"
+chown -hR "$WEB_USER:$WEB_GROUP" "$stage/nextcloud"
 find "$stage/nextcloud" -type d -exec chmod 750 {} +
 find "$stage/nextcloud" -type f -exec chmod 640 {} +
 [[ $(stat -c %d "$NEXTCLOUD_PATH") == "$(stat -c %d "$stage/nextcloud")" ]] || fail 'Replacement must remain on the same filesystem.'
@@ -754,8 +912,12 @@ restore_cron
 occ maintenance:mode --off
 occ status --output=json | php_info status off "$download_version" > "$recovery/status.version"
 # Services were already verified active. A browser/client check remains mandatory.
-set_phase complete 'Local upgrade checks passed. Verify the web interface and a client before removing recovery artifacts.' --success
+set_phase complete 'Version, migration status and service checks passed.' --success
 rm -- "$BACKUP_PATH/upgrade-active"
 sync -f "$BACKUP_PATH"
 finished=yes
-log "Recovery retained: $recovery and $old_path"
+log --success "Upgrade complete: $current_release -> $download_version. Elapsed $((SECONDS - upgrade_started))s; maintenance window $((SECONDS - offline_started))s."
+printf '  %-18s %s\n' 'Recovery directory:' "$recovery" 'Previous code:' "$old_path" 'Data directory:' "$data_path"
+if [[ $BACKUP_ARCHIVE == yes ]]; then log "Restore bundle: $recovery/backup.tar (checksum: backup.tar.sha256)"; fi
+if [[ -n $BACKUP_SSH_DEST ]]; then log "Off-server archive: $ssh_host:$ssh_directory/${recovery##*/}.tar"; fi
+log 'Next: check the web interface, file upload/download and client sync; review Administration Overview and re-enable compatible apps.'

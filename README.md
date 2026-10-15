@@ -12,10 +12,12 @@ disk before the installation is taken offline.
 
 ## Requirements
 
-The script supports an archive-based Nextcloud installation on Linux with:
+The script supports one archive-based Nextcloud installation on a systemd Linux
+server with:
 
-- Bash, GNU command-line utilities and PHP CLI with SimpleXML, available as `php`.
-- Nextcloud commands and cron jobs running as `www-data`.
+- Bash, GNU command-line utilities and PHP CLI with SimpleXML.
+- A non-root HTTP account for Nextcloud commands and jobs, selected with
+  `WEB_USER` (default `www-data`).
 - A web server with a systemd service unit: Nginx with PHP-FPM, or Apache 2.4
   with PHP-FPM or `mod_php`. Managed services must already be running.
 - Monit, when using the default service manager. Its service names must match
@@ -38,11 +40,23 @@ For MariaDB/MySQL, install `mariadb` and `mariadb-dump`, or their `mysql` and `m
 For PostgreSQL, install `psql` and `pg_dump`. The script checks required commands
 before upgrading.
 
+This follows Nextcloud's [manual archive upgrade method](https://docs.nextcloud.com/server/stable/admin_manual/maintenance/manual_upgrade.html).
+For Docker/AIO, Snap, pre-built appliances or distribution packages, Nextcloud's
+[upgrade overview](https://docs.nextcloud.com/server/stable/admin_manual/maintenance/upgrade.html)
+directs administrators to the method provided by that installation. This script does not coordinate
+multiple application servers, remote web/PHP services or external workers. It
+supports MariaDB/MySQL and PostgreSQL, not SQLite or Oracle. Database access uses
+the configured host and credentials with standard client settings; deployments
+requiring extra connection options, client certificates or custom PostgreSQL
+ports need separate review before use.
+
 Installation and backup paths must be existing, canonical absolute paths without
 symlinks. The backup directory must be root owned and not writable by group or
-others. Application files must not contain symlinks or mounts; internal data
-directories are excluded from application file checks, but must not contain
-mounts because they are moved during replacement. External configuration
+others. Relative application symlinks must resolve to regular files inside the
+installation, outside user data; links inside `config/` must stay inside it.
+Directory links, broken/external links and application mounts are unsupported.
+Internal data directories are excluded from application file checks, but must
+not contain mounts because they are moved during replacement. External configuration
 directories and external or nested custom app directories are not supported.
 
 **Data backup is off by default.** Use your existing backup system, or enable
@@ -84,6 +98,14 @@ available or enable this script's data backup. Schedule an interruption to web
 access and background jobs. Stopping a selected service affects every site or PHP
 pool that it hosts.
 
+The script manages Nextcloud entries in `WEB_USER`'s account crontab. Pause any
+other job launchers yourself before running it: systemd timers, `/etc/cron.d`
+jobs, remote cron services and dedicated workers are not suspended automatically.
+An absent account crontab is allowed and is left absent. Nextcloud documents
+several [background-job methods](https://docs.nextcloud.com/server/stable/admin_manual/configuration_server/background_jobs_configuration.html);
+choose the shutdown procedure that matches yours, and resume those launchers
+after verification.
+
 ## Running an upgrade
 
 To find and install the next eligible stable update:
@@ -92,10 +114,18 @@ To find and install the next eligible stable update:
 sudo nextcloud-upgrade
 ```
 
+To see usage and available settings without starting preparation or requiring
+root access:
+
+```bash
+nextcloud-upgrade --help
+```
+
 The script checks the installation, downloads and validates the release, stages
 the new files, and checks database access and backup capacity. It then displays
-the current and target versions and asks for confirmation. Enter `y` or `Y` to
-continue; any other answer cancels. Cancellation at this prompt leaves the
+the versions, selected account/PHP, services, data and backup settings, and asks
+for confirmation. Enter `y` or `Y` to continue; any other answer cancels.
+Cancellation at this prompt leaves the
 installation running, although downloads and preparation have already occurred.
 
 Progress messages pair text and phase labels with `[i]` for information, `[✓]`
@@ -108,10 +138,11 @@ colours, for example `sudo env NO_COLOR=1 nextcloud-upgrade`.
 After confirmation, the script enables maintenance mode, suspends this
 installation's cron entries, stops the web server and any configured separate
 PHP-FPM service through the selected manager, waits for existing Nextcloud CLI
-jobs to finish, and creates
-the recovery backups. It then
-replaces the application, runs `occ upgrade`, verifies the installed version and
+jobs to finish, and creates the recovery backups. It then replaces the
+application, runs `occ upgrade`, verifies the installed version and
 database migration state, and restores services and the original cron schedule.
+The completion summary gives elapsed time, the maintenance window and the exact
+recovery, previous-code and optional archive locations.
 
 You can also supply a specific stable release within the currently installed
 major version. For example, when upgrading 34.0.0 to 34.0.1:
@@ -131,6 +162,11 @@ Re-enable compatible third-party apps after verification. Before another major
 upgrade, allow any background migrations to finish. The script's local checks
 do not replace verification through your web interface.
 
+Review the target release's critical changes and any long-running database
+maintenance recommended by Administration Overview. `occ upgrade` performs
+Nextcloud's upgrade repairs; the script does not automatically run every optional
+repair, index-building or migration command.
+
 ## Options and examples
 
 Configure the script with environment variables. Use `sudo env` to pass them to
@@ -146,6 +182,9 @@ sudo env NEXTCLOUD_PATH=/srv/nextcloud \
 | --- | --- | --- |
 | `NEXTCLOUD_PATH` | `/var/www/nextcloud` | Nextcloud installation directory. |
 | `BACKUP_PATH` | `/var/backups/nextcloud` | Directory for upgrade recovery backups. |
+| `WEB_USER` | `www-data` | Non-root HTTP/Nextcloud account; also selects the account crontab and running CLI jobs to inspect. |
+| `WEB_GROUP` | Primary group of `WEB_USER` | Group applied to staged application files; select a group readable by the web/PHP processes. |
+| `PHP_BIN` | `php` | PHP CLI executable. An absolute path avoids ambiguity between installed PHP versions. |
 | `BACKUP_DATA` | `no` | `yes` copies and verifies the configured filesystem data directory before migration. |
 | `BACKUP_ARCHIVE` | `no` | `yes` also creates `backup.tar` and its SHA256 checksum inside the attempt's backup directory. |
 | `BACKUP_SSH_DEST` | Unset | Optional extra copy to `[user@]host:/absolute/directory` as a private archive, before migration. |
@@ -157,6 +196,7 @@ sudo env NEXTCLOUD_PATH=/srv/nextcloud \
 | `WAIT_AFTER_SERVER_START` | `20` | Maximum seconds to poll each service state after its start/stop command returns. |
 | `DOWNLOAD_FORMAT` | `tar.bz2` | Release archive format: `tar.bz2` or `zip`. |
 | `CHECKSUM_TYPE` | `sha256` | Checksum: `sha256`, `sha512`, or legacy `md5`. Prefer SHA256 or SHA512. |
+| `NO_COLOR` | Unset | Set to disable terminal colours. |
 
 To use systemd directly on a server without Monit supervision:
 
@@ -194,9 +234,17 @@ sudo env WEB_SERVICE=apache2 PHP_SERVICE=none nextcloud-upgrade
 ```
 
 Use `WEB_SERVICE=httpd` instead when that is your actual service name. These
-settings can be combined with `SERVICE_MANAGER=systemd`. Nextcloud commands and
-file ownership still use `www-data`; changing the service name does not change
-that requirement or configure the web server.
+settings can be combined with `SERVICE_MANAGER=systemd`. Select the actual HTTP
+account and PHP executable separately. For example, on a host using `apache`
+and `httpd`:
+
+```bash
+sudo env SERVICE_MANAGER=systemd WEB_SERVICE=httpd PHP_SERVICE=php-fpm \
+    WEB_USER=apache WEB_GROUP=apache PHP_BIN=/usr/bin/php nextcloud-upgrade
+```
+
+Changing these options does not install or configure the web server. The selected
+account must already run Nextcloud and be able to read its configuration and data.
 
 `PHP_SERVICE=none` explicitly means there is no separate PHP runtime to manage.
 It does not detect the PHP setup. Only the web service is then checked, stopped
@@ -211,9 +259,12 @@ For a different PHP-FPM service and a longer service-state polling timeout:
 sudo env PHP_SERVICE=php8.3-fpm WAIT_AFTER_SERVER_START=60 nextcloud-upgrade
 ```
 
-The selected PHP version must support both the installed and target Nextcloud
-versions. `PHP_SERVICE` selects the service; command-line operations still use
-`php` from the root user's command path.
+CLI and web PHP must meet the requirements of both the installed and target
+Nextcloud versions, including required extensions. `PHP_SERVICE` selects the
+service; `PHP_BIN` selects the command-line executable. Use matching PHP versions
+and check both configurations, since their extension and memory settings can
+differ. The script checks CLI PHP against the downloaded release; it does not
+validate the web runtime, operating system or database version automatically.
 
 To use ZIP and SHA512:
 
@@ -224,6 +275,8 @@ sudo env DOWNLOAD_FORMAT=zip CHECKSUM_TYPE=sha512 nextcloud-upgrade
 Checksum verification checks the downloaded archive against a checksum fetched
 from the same HTTPS release server; it is not an independent signature check.
 Cron entries are restored exactly, including their schedules and disabled entries.
+Only recognized entries for this installation's `cron.php` are suspended;
+unrecognized invocations require review before the script proceeds.
 
 ## Data backups and destinations
 
@@ -365,10 +418,13 @@ release. The same protection applies to automatically transferred custom themes
 and additional app directories. A conflict stops the upgrade before maintenance
 mode so you can review it; this option cannot carry local modifications to
 shipped code into the new version. The script checks the source tree again after
-stopping services and refuses symlinks, mounts and special files.
+stopping services and refuses unsafe links, mounts and special files. A selected
+path must not itself traverse a symlink; safe internal file links inside a
+selected directory are allowed.
 
 Ownership and permissions are applied only to the staged application:
-`www-data:www-data`, directories `750`, and files `640`.
+`WEB_USER:WEB_GROUP`, directories `750`, and files `640`. Symlink targets are not
+followed by the ownership operation; user-data permissions are retained.
 
 ## Backups and troubleshooting
 
@@ -379,13 +435,15 @@ Each confirmed attempt creates a unique directory under `BACKUP_PATH`, named
 | --- | --- |
 | `database.sql.gz` | Validated compressed database dump. |
 | `config/` | Complete configuration directory, including extra fragments. |
+| `.htaccess`, `.user.ini` | Pre-upgrade root configuration files, when present. |
 | `custom/` | Preserved apps, themes and extra files under their installation-relative paths, when present. |
 | `data/` | Verified filesystem data copy, only with `BACKUP_DATA=yes`. |
 | `backup.tar`, `backup.tar.sha256` | Optional bundle and checksum, only with `BACKUP_ARCHIVE=yes`. |
 | `manifest`, `preserved-paths`, `phase`, cron snapshots | Installation/version details, selected custom paths and recovery state. |
 | `upgrade.log` | Migration output, once migration starts. |
 
-The tar bundle contains the database dump, configuration, custom components,
+The tar bundle contains the database dump, configuration (including the root
+files above), custom components,
 optional data and recovery metadata as it stood **before migration**. The SSH
 archive contains the same components. Archives do not include the full old
 application code or logs written after the backup was taken. Keep the matching
@@ -410,12 +468,18 @@ The resulting `config/`, `database.sql.gz`, `custom/` (when present) and optiona
 `data/` can be used as a matching set following
 [Nextcloud's restore guidance](https://docs.nextcloud.com/server/stable/admin_manual/maintenance/restore.html).
 Copy any entries in `custom/` to their corresponding installation-relative
-locations when restoring the old release.
+locations when restoring the old release, and restore `.htaccess`/`.user.ini`
+when present. Nextcloud may regenerate `.htaccess` during an upgrade; review
+custom directives afterward.
 Restore while access and background jobs are blocked, using application code
-matching `previous_version` in `manifest`. If `data/` is absent, recover data
+matching `previous_version` in `manifest`, and restore the SQL dump into a clean
+database as described in the linked guide. Check file ownership and permissions
+against the recorded HTTP account/group before starting services. If `data/` is absent, recover data
 through your existing backup system as needed; a SQL dump and configuration
-alone cannot recover lost user files. This script does not automatically restore
-data or import a database after migration has started.
+alone cannot recover lost user files. For an outdated data backup, consult the
+restore guide's client-synchronization advice before reconnecting clients.
+This script does not automatically restore data or import a database after
+migration has started.
 
 The previous application is retained alongside the installation in a unique
 `.old.upgrade-…` directory. Successful upgrades remove disposable download and
@@ -460,14 +524,17 @@ uses them and the in-memory flags to recover or leave access blocked. Keep the
 migration boundary recorded **before** launching `occ upgrade`. Application
 rollback is only automatic before migration starts.
 
-`occ` runs Nextcloud commands as `www-data`; `php_info` parses structured metadata
-and validates releases/status. `stop_services`, `start_services` and
+`occ` runs Nextcloud commands as `WEB_USER` with `PHP_BIN`; installed build
+metadata is also loaded as that user. Other `php_info` modes parse structured
+metadata and validate downloaded releases/status. `stop_services`, `start_services` and
 `wait_service` handle service control through `service_control`; `check_services`
 validates the selected backend's prerequisites. `restore_cron` checks for
 concurrent edits.
 `add_preserved_path` builds the transfer list and rejects collisions;
 `check_preserved_path` validates entries before copying. `check_application_tree`
-rejects unsupported source files and mounts before preparation and after shutdown.
+rejects unsupported source files and mounts before preparation and after shutdown;
+`check_file_links` verifies internal file targets. Archive link checks also prevent
+links from redirecting extraction.
 `find_application` prunes internal data from application scans; live data is moved
 only after staged ownership/permission changes. `restore_internal_data` moves it
 back before a pre-migration application rollback. `backup_data` verifies a stopped
