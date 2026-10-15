@@ -36,7 +36,7 @@ Download the archive and checksum from
 [Releases](https://github.com/msanguineti/nextcloud-scripts/releases). For example:
 
 ```bash
-release=v0.1.0
+release=v1.1.0
 url="https://github.com/msanguineti/nextcloud-scripts/releases/download/$release"
 curl --fail --location --remote-name "$url/nextcloud-upgrade-$release.tar.gz"
 curl --fail --location --remote-name "$url/nextcloud-upgrade-$release.tar.gz.sha256"
@@ -367,7 +367,7 @@ set `RELEASE_APP_CLIENT_ID` (environment variable) and `RELEASE_APP_PRIVATE_KEY`
 To build a local package:
 
 ```bash
-bash .github/scripts/package-release.sh v0.1.0
+bash .github/scripts/package-release.sh v1.1.0
 ```
 
 Downloads are written to `dist/`.
