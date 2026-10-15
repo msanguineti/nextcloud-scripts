@@ -84,8 +84,9 @@ sudo nextcloud-upgrade
 ```
 
 Review the versions, paths, services, background-job mode and backup settings at
-confirmation. Enter `y` to proceed. Long preparation steps show updates every
-15 seconds. After enabling maintenance, the script allows 30 seconds for active
+confirmation. Enter `y` to proceed. Long preparation steps show a spinner and
+elapsed time in a terminal, or status lines every 15 seconds in redirected output.
+After enabling maintenance, the script allows 30 seconds for active
 requests before stopping services and taking backups.
 
 To use a 60-second settling pause:

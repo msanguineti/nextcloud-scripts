@@ -126,12 +126,32 @@ start_progress() {
         # This display process must never inherit the upgrade's recovery traps.
         trap - EXIT ERR INT TERM HUP
         set +e
-        timer=''
-        trap 'for timer in $(jobs -pr); do kill "$timer" 2>/dev/null; done; wait; exit 0' INT TERM HUP
+        interactive=no spinner_line='' frames="|/-\\" frame=0 timer=''
+        [[ -t 2 && ${TERM:-dumb} != dumb ]] && interactive=yes
+        trap '
+            for timer in $(jobs -pr); do kill "$timer" 2>/dev/null; done
+            wait
+            [[ -z $spinner_line ]] || printf "\r%*s\r" "${#spinner_line}" "" >&2
+        ' EXIT
+        trap 'exit 0' INT TERM HUP
         while :; do
-            sleep 15 &
+            if [[ $interactive == yes ]]; then
+                # This is activity feedback, not a measured completion percentage.
+                printf -v spinner_line '  [%s] %ss elapsed' "${frames:frame:1}" "$((SECONDS - started))"
+                if [[ -z ${NO_COLOR+x} ]]; then
+                    printf '\r\033[1;36m%s\033[0m' "$spinner_line" >&2
+                else
+                    printf '\r%s' "$spinner_line" >&2
+                fi
+                frame=$(((frame + 1) % 4))
+                sleep 0.1 &
+            else
+                sleep 15 &
+            fi
             wait "$!" || exit 0
-            log "$message ($((SECONDS - started))s elapsed; still running)." >&2
+            if [[ $interactive == no ]]; then
+                log "$message ($((SECONDS - started))s elapsed; still running)." >&2
+            fi
         done
     ) &
     progress_pid=$!
