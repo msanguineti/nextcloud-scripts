@@ -1,177 +1,230 @@
 # Nextcloud Upgrade Script
 
-This open source shell script automates the upgrade process for Nextcloud installations. It leverages a technique—observed in Nextcloud’s own GitHub scripts—that queries an updater server to determine the correct upgrade path and download the appropriate upgrade file. The remainder of the upgrade procedure follows the steps suggested in the official Nextcloud documentation.
+Upgrade an existing Nextcloud installation from the command line. The script
+finds the next eligible stable release, downloads and checks it, backs up the
+database and configuration, and installs the update while managing maintenance
+mode, services and scheduled jobs.
 
-> **Disclaimer:**  
-> This script is provided "as-is", without any warranty. It is not officially endorsed or supported by Nextcloud. Use it at your own risk and always test in a safe environment before deploying in production.
-
----
-
-## Overview
-
-When you run this script, it will:
-
-1. **Check for Updates:**  
-   Query Nextcloud’s updater server (the same method used internally when you click the "Check update" button) to determine if a new version is available and whether your current version is eligible for upgrade.  
-   *Note:* Nextcloud’s release files follow a naming convention (e.g., a returned version `30.0.6.2` is adjusted to `30.0.6` for the download).
-
-2. **Download and Verify the Upgrade File:**  
-   It constructs the download URL based on your chosen archive format (default is `tar.bz2`, but `zip` is supported) and checksum type (default is SHA256). It then downloads both the archive and its checksum file, filtering the checksum file to verify only the correct line.
-
-3. **Backup Procedures:**  
-   - **Database Backup:** Supports both MySQL/MariaDB and PostgreSQL.  
-     - For MySQL/MariaDB, it uses a temporary credentials file to securely pass credentials to `mysqldump`.  
-     - For PostgreSQL, it sets the `PGPASSWORD` environment variable before running `pg_dump`.
-   - **Configuration Backup:** The Nextcloud configuration folder is copied to a backup location.
-  
-> **Note:** The script does not back up your data directory. It is recommended to back up your data separately.
-
-4. **Upgrade Execution:**  
-   - The script puts Nextcloud into maintenance mode.
-   - It stops the web service and disables cron jobs.
-   - It extracts the downloaded archive, moves the current installation to an "old" directory, installs the new version, restores the configuration file, and fixes file permissions.
-   - It then restarts the web service, re-enables cron jobs, and removes maintenance mode.
-   
-5. **User Confirmation:**  
-   Before proceeding, the script displays the current version and the new version and asks for your confirmation.
-
----
-
-## Features
-
-- **Automated Update Check:** Uses the updater server to automatically determine if an upgrade is available and enforces proper upgrade paths.
-- **Flexible Archive Format:** Supports both `tar.bz2` (default) and `zip` files.
-- **Checksum Verification:** Downloads and verifies a checksum file (SHA256, MD5, or SHA512) to ensure file integrity.
-- **Database Backup:** Supports both MySQL/MariaDB (using a temporary credentials file) and PostgreSQL (using the `PGPASSWORD` environment variable).
-- **Customizable Service Control:**  
-  The script uses default commands (via `monit`) to stop and start the web server, but these can be easily overridden.
-- **Configurable Delays:** Custom delays can be set before backing up and after restarting services.
-- **Secure Temporary File Handling:** Uses traps to clean up temporary files if the script exits unexpectedly.
-- **Cron Job Management:** Disables and then re-enables cron jobs for the `www-data` user during the upgrade.
-
----
+It keeps the previous application files and recovery backups so that a failed
+upgrade can be investigated and recovered. Downloads and extraction happen on
+disk before the installation is taken offline.
 
 ## Requirements
 
-- **Operating System:** Linux with Bash.
-- **Essential Tools:**  
-  - `curl`, `wget`
-  - `tar` (or `unzip` if using ZIP format)
-  - `mysqldump` or `pg_dump`
-  - `monit` (by default for service control; if you use another system such as systemd, see configuration below)
-  - `php` (for Nextcloud’s `occ` command)
-  - `mktemp`
-  - Checksum utilities: `sha256sum` (default), `md5sum`, or `sha512sum`
-- **Nextcloud Installation:**  
-  The script assumes Nextcloud is installed (default path: `/var/www/nextcloud`).
+The script supports a conventional Linux installation with:
 
----
+- Bash, GNU command-line utilities and PHP CLI with SimpleXML, available as `php`.
+- Nextcloud commands and cron jobs running as `www-data`.
+- Nginx and PHP-FPM managed by Monit, with service names matching their systemd
+  unit names. Both services must already be running and monitored.
+- MariaDB/MySQL or PostgreSQL. Database settings are read from Nextcloud.
+- A user-data directory outside the Nextcloud installation directory.
+- Enough disk space and inodes for the downloaded release, extracted files,
+  staged installation and recovery backups.
 
-## Configuration
+The required utilities include `sudo`, `curl`, `monit`, `systemctl`, `crontab`,
+`pgrep`, `flock`, `findmnt`, `gzip`, and checksum tools. The default archive format
+uses `tar` and `bzip2`; ZIP requires `unzip` and `zipinfo`. For MariaDB/MySQL,
+install `mariadb` and `mariadb-dump`, or their `mysql` and `mysqldump` equivalents.
+For PostgreSQL, install `psql` and `pg_dump`. The script checks required commands
+before upgrading.
 
-The following environment variables can be overridden to suit your environment:
+Installation and backup paths must be existing, canonical absolute paths without
+symlinks. The backup directory must be root owned and not writable by group or
+others. Symlinks or mounts inside the application directory, external configuration
+directories, and external or nested custom app directories are not supported.
 
-- **NEXTCLOUD_PATH**  
-  _Default:_ `/var/www/nextcloud`  
-  **Description:** Path to your Nextcloud installation.
+Keep a separate backup of Nextcloud user data. **This script backs up the database
+and configuration, but does not back up user data.** Those recovery artifacts are
+useful for an upgrade failure; recovering from data loss also requires a suitable
+data backup. Independently scheduled database/server and data backups may not
+represent the same point in time.
 
-- **BACKUP_PATH**  
-  _Default:_ `/var/backups/nextcloud`  
-  **Description:** Directory where backups are stored. **(Must be an absolute path.)**
+## Installation
 
-- **WEB_SERVICE**  
-  _Default:_ `nginx`  
-  **Description:** Name of the web server service to be stopped/started.
+Clone the repository on the server that runs Nextcloud:
 
-- **STOP_SERVICE_CMD / START_SERVICE_CMD**  
-  _Default:_  
-  ```bash
-  STOP_SERVICE_CMD=(monit stop "$WEB_SERVICE")
-  START_SERVICE_CMD=(monit start "$WEB_SERVICE")
-  ```  
-  **Description:** Array commands to stop and start your web server.  
-  **Example:** If you use systemd, you could override them with:  
-  ```bash
-  export STOP_SERVICE_CMD=(systemctl stop apache2)
-  export START_SERVICE_CMD=(systemctl start apache2)
-  ```
+```bash
+git clone https://github.com/msanguineti/nextcloud-scripts.git
+cd nextcloud-scripts
+```
 
-- **WAIT_BEFORE_BACKUP**  
-  _Default:_ `60`  
-  **Description:** Seconds to wait after enabling maintenance mode before starting the backup.
+Install the script and create its default backup directory:
 
-- **WAIT_AFTER_SERVER_START**  
-  _Default:_ `20`  
-  **Description:** Seconds to wait after starting the web server before proceeding with the upgrade.
+```bash
+sudo install -o root -g root -m 0755 nextcloud-upgrade.sh /usr/local/sbin/nextcloud-upgrade
+sudo install -d -o root -g root -m 0700 /var/backups/nextcloud
+```
 
-- **DOWNLOAD_FORMAT**  
-  _Default:_ `tar.bz2`  
-  **Description:** Format to download the Nextcloud release (`tar.bz2` or `zip`).
+Alternatively, run `sudo ./nextcloud-upgrade.sh` from the checkout. To update an
+installed copy, update your checkout, review the changes, and repeat the script
+installation command.
 
-- **CHECKSUM_TYPE**  
-  _Default:_ `sha256`  
-  **Description:** Checksum algorithm to verify the downloaded archive. Options: `sha256`, `md5`, or `sha512`.
+Before the first upgrade, confirm that your installation matches the requirements,
+review the target Nextcloud release notes and app compatibility, and verify that
+your separate data backups are available. Schedule an interruption to web access
+and background jobs.
 
----
+## Running an upgrade
 
-## Usage
+To find and install the next eligible stable update:
 
-1. **Install Dependencies:**  
-   Ensure all required commands (listed above) are installed.
+```bash
+sudo nextcloud-upgrade
+```
 
-2. **Download the Script:**  
-   Clone or download this repository to your server.
+The script checks the installation, downloads and validates the release, stages
+the new files, and checks database access and backup capacity. It then displays
+the current and target versions and asks for confirmation. Enter `y` or `Y` to
+continue; any other answer cancels. Cancellation at this prompt leaves the
+installation running, although downloads and preparation have already occurred.
 
-3. **Run the Script as Root:**  
-   ```bash
-   sudo ./nextcloud-upgrade.sh
-   ```
+After confirmation, the script enables maintenance mode, suspends this
+installation's cron entries, stops Nginx and PHP-FPM through Monit, waits for
+existing Nextcloud CLI jobs to finish, and creates the recovery backups. It then
+replaces the application, runs `occ upgrade`, verifies the installed version and
+database migration state, and restores services and the original cron schedule.
 
-4. **Follow the Prompts:**  
-   - The script will check for available updates.
-   - It downloads and verifies the upgrade file.
-   - It displays your current version and the new version, then asks for confirmation:
-     ```
-     Do you want to proceed with the upgrade? [Y/n]:
-     ```
-   - Enter `Y` to continue or `n` to abort.
+You can also supply a specific stable release within the currently installed
+major version. For example, when upgrading 34.0.0 to 34.0.1:
 
----
+```bash
+sudo nextcloud-upgrade 34.0.1
+```
 
-## Database Backup
+Use automatic discovery for major upgrades. Downgrades and upgrades that skip a
+major version are rejected. Automatic discovery requires the stable update
+channel; Nextcloud's release requirements and compatibility guidance still apply.
 
-The script supports both MySQL/MariaDB and PostgreSQL:
+After the script finishes, open Nextcloud, check Administration Overview, test a
+file upload/download and client sync, and confirm that background jobs resume.
+The script's local checks do not replace verification through your web interface.
 
-- **MySQL/MariaDB:**  
-  Uses a temporary credentials file to pass database credentials to `mysqldump` securely.  
+## Options and examples
 
-- **PostgreSQL:**  
-  Uses the `PGPASSWORD` environment variable for authentication and calls `pg_dump` to create the backup.
+Configure the script with environment variables. Use `sudo env` to pass them to
+the root process:
 
-The database type is determined by reading the `dbtype` value from Nextcloud’s configuration. The backup file is created with a `.bak` extension and then compressed with `gzip`.
+```bash
+sudo env NEXTCLOUD_PATH=/srv/nextcloud \
+    BACKUP_PATH=/var/backups/nextcloud \
+    nextcloud-upgrade
+```
 
----
+| Variable | Default | Purpose |
+| --- | --- | --- |
+| `NEXTCLOUD_PATH` | `/var/www/nextcloud` | Nextcloud installation directory. |
+| `BACKUP_PATH` | `/var/backups/nextcloud` | Directory for upgrade recovery backups. |
+| `WEB_SERVICE` | `nginx` | Web-server service name in Monit and systemd. |
+| `PHP_SERVICE` | `php8.4-fpm` | PHP-FPM service name in Monit and systemd. |
+| `WAIT_BEFORE_BACKUP` | `60` | Maximum seconds to wait for existing Nextcloud cron/occ processes after services stop. |
+| `WAIT_AFTER_SERVER_START` | `20` | Maximum seconds to wait for each service to reach its started or stopped state. |
+| `DOWNLOAD_FORMAT` | `tar.bz2` | Release archive format: `tar.bz2` or `zip`. |
+| `CHECKSUM_TYPE` | `sha256` | Checksum: `sha256`, `sha512`, or legacy `md5`. Prefer SHA256 or SHA512. |
 
-## Attribution and Explanation
+For a different PHP-FPM service and a longer service timeout:
 
-- **Updater Server Technique:**  
-  Although the official Nextcloud documentation does not explicitly recommend using the updater server, this script employs a technique found in Nextcloud’s GitHub scripts. This is how the Nextcloud installation determines if an upgrade is available and whether you’re on the correct minor version for a major upgrade. This script automates that process.
+```bash
+sudo env PHP_SERVICE=php8.3-fpm WAIT_AFTER_SERVER_START=60 nextcloud-upgrade
+```
 
-- **Upgrade Steps:**  
-  The remaining steps—backing up the database and configuration, putting Nextcloud into maintenance mode, stopping the web service, extracting the new version, and restoring permissions—are based on the procedures suggested by the Nextcloud maintainers.
+The selected PHP version must support both the installed and target Nextcloud
+versions. `PHP_SERVICE` selects the service; command-line operations still use
+`php` from the root user's command path.
 
----
+To use ZIP and SHA512:
 
-## Contributing
+```bash
+sudo env DOWNLOAD_FORMAT=zip CHECKSUM_TYPE=sha512 nextcloud-upgrade
+```
 
-Contributions, bug reports, and feature requests are welcome. If you have suggestions or improvements, please open an issue or submit a pull request.
+Checksum verification checks the downloaded archive against a checksum fetched
+from the same HTTPS release server; it is not an independent signature check.
+Monit controls service starts and stops; systemd is used to verify service state.
+Cron entries are restored exactly, including their schedules and disabled entries.
 
----
+## Custom apps, themes and configuration
+
+The script transfers the complete `config/` directory, `.htaccess`, `.user.ini`,
+custom themes, and additional direct-child app directories configured in
+`apps_paths`. Apps in the old `apps/` directory are copied when absent from the
+new release, unless their metadata marks them as shipped apps. When an app is
+included in the new release, the new release's copy takes precedence.
+
+Check custom app and theme compatibility before upgrading. Other custom files
+are retained in the old installation but are not automatically transferred.
+Ownership and permissions are applied only to the staged application:
+`www-data:www-data`, directories `750`, and files `640`.
+
+## Backups and troubleshooting
+
+Each confirmed attempt creates a unique directory under `BACKUP_PATH`, named
+`upgrade-TIMESTAMP.RANDOM`. After a successful backup it contains
+`database.sql.gz` and the complete `config/` directory. It also records original
+cron entries, recovery paths, progress and, once migration starts, `upgrade.log`.
+Files ending in `.part` are incomplete backups.
+
+The previous application is retained alongside the installation in a unique
+`.old.upgrade-…` directory. Successful upgrades remove disposable download and
+staging files, but keep the recovery backups and old application. Remove obsolete
+recovery copies deliberately after verifying the upgrade; check their exact paths
+and ensure they contain no user-data mounts before deleting them.
+
+If an upgrade fails:
+
+- **Before database migration:** the script attempts to restore the original
+  application, services, cron and maintenance state. Confirm that recovery
+  succeeded before retrying.
+- **Once database migration has started:** the script attempts to block access
+  and keeps recovery artifacts for manual intervention. Do not restore old
+  application files alone against a potentially migrated database. Resolve and
+  resume the target upgrade, or restore matching database, configuration and
+  application backups after assessing user-data consistency.
+
+Errors identify the failed operation or script line and the recovery location.
+For an unresolved attempt, read `BACKUP_PATH/upgrade-active` and the referenced
+directory's `manifest`, `phase`, `failure` and `upgrade.log` where available. Read
+these as text; do not execute or source them. The script refuses another upgrade
+until that attempt has been resolved. Preserve the marker and backups while
+investigating, stop access through Monit, and check for any still-running
+migration process before recovery. Reconcile external crontab edits rather than
+blindly replacing them.
+
+Existing maintenance mode, a pending migration, a concurrent upgrade or a legacy
+`.old` directory also prevents an upgrade. Identify and resolve the underlying
+state before trying again; do not delete recovery files merely to bypass a check.
+
+After a reboot, power loss or forced termination, inspect the installation and
+recorded recovery state manually. The active-attempt marker prevents a new run;
+it does not prevent systemd or Monit from starting services after reboot.
+
+## For contributors
+
+The script is organized around preparation, backup, application replacement,
+migration and restoration. `set_phase` records recovery boundaries; `on_exit`
+uses them and the in-memory flags to recover or leave access blocked. Keep the
+migration boundary recorded **before** launching `occ upgrade`. Application
+rollback is only automatic before migration starts.
+
+`occ` runs Nextcloud commands as `www-data`; `php_info` parses structured metadata
+and validates releases/status. `stop_services`, `start_services` and
+`wait_service` handle service control; `restore_cron` checks for concurrent edits.
+Keep ownership/deletion operations away from the user-data directory.
+
+Run local checks from the repository:
+
+```bash
+bash -n nextcloud-upgrade.sh
+shellcheck nextcloud-upgrade.sh
+python3 tests/test_upgrade.py
+```
+
+Tests require Python 3, PHP 8.4 or newer with SimpleXML, and both archive toolsets.
+Set `TEST_PHP=/path/to/php` to select another PHP executable. Tests use isolated
+files and mocked Nextcloud, database and service commands; no root access,
+network connection or running Nextcloud installation is required. Preserve
+coverage of failures around backup, replacement, migration and restoration.
 
 ## License
 
-This project is licensed under the **MIT License**. See the [LICENSE.md](LICENSE.md) file for details.
-
----
-
-*Please review and test the script thoroughly before using it in a production environment.*
+[MIT](LICENSE.md). This project is not affiliated with or endorsed by Nextcloud.

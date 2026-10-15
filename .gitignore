@@ -2,3 +2,6 @@
 
 # log files
 .log
+
+# Local experiments
+/.dev/
