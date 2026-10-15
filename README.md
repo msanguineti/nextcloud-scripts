@@ -248,11 +248,21 @@ user files. Keep recovery files until the upgraded installation is verified.
 
 ## Custom files
 
-The script preserves `config/`, `.htaccess`, `.user.ini`, custom themes,
-additional direct-child app directories in `apps_paths`, and third-party apps
-absent from the new release. Shipped app versions take precedence; removed
-shipped apps are not carried forward. Check app/theme compatibility and review
-custom `.htaccess` directives after upgrading.
+The script preserves `config.php`, configuration fragments, other local configuration
+files, custom themes, additional app directories in `apps_paths`, and third-party
+apps absent from the new release. Unmodified shipped files, including `.user.ini`,
+`.htaccess` and configuration examples, use the new release's defaults. Nextcloud
+regenerates its installation-specific `.htaccess` section during the upgrade.
+
+Modified shipped configuration files are retained with a warning. Review them
+against the new defaults; they may trigger integrity warnings. Changed configuration
+templates are compared with reference files fetched from Nextcloud's official GitHub
+source for the installed version. If original hashes or reference files are
+unavailable, existing files are retained unless identical to the new defaults.
+Recovery backups still contain the complete old configuration and both overrides.
+
+Shipped app versions take precedence; removed shipped apps are not carried
+forward. Check app/theme compatibility before upgrading.
 
 For additional files, create `/root/nextcloud-preserve.txt`:
 

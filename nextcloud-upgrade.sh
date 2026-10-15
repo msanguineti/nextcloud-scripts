@@ -170,6 +170,70 @@ need() { command -v "$1" >/dev/null || fail "Required command missing: $1"; }
 occ() { (cd "$NEXTCLOUD_PATH" && sudo -u "$WEB_USER" "$PHP_BIN" ./occ "$@"); }
 config() { occ config:system:get "$1"; }
 
+fetch_config_originals() {
+    local path reference fetched
+    # config/ is excluded from Nextcloud's signed hashes; read only its shipped templates.
+    for path in config/.htaccess config/config.sample.php; do
+        [[ -f $NEXTCLOUD_PATH/$path && ! -L $NEXTCLOUD_PATH/$path ]] || continue
+        if [[ -f $stage/nextcloud/$path ]] && cmp -s -- "$NEXTCLOUD_PATH/$path" "$stage/nextcloud/$path"; then continue; fi
+        reference="$workspace/shipped-config/$path"
+        mkdir -p -- "$(dirname -- "$reference")"
+        start_progress "Reading original $path from Nextcloud $current_release"
+        if curl --fail --silent --location --proto '=https' --proto-redir '=https' \
+            --connect-timeout 10 --max-time 20 -o "$reference.part" \
+            "https://raw.githubusercontent.com/nextcloud/server/v$current_release/$path"; then
+            fetched=yes
+        else
+            fetched=no
+        fi
+        stop_progress
+        if [[ $fetched == yes ]]; then
+            mv -T -- "$reference.part" "$reference"
+        else
+            rm -f -- "$reference.part"
+            log --warning "Cannot fetch the original $path; retaining it if its origin cannot be determined."
+        fi
+    done
+}
+
+prepare_local_files() {
+    local action=$1 kind path destination ancestor
+    php_info local-files "$NEXTCLOUD_PATH" "$stage/nextcloud" "$workspace/shipped-config" > "$workspace/local-files"
+    while IFS= read -r -d '' kind; do
+        IFS= read -r -d '' path || fail 'Incomplete local-file classification.'
+        case $kind in
+            baseline)
+                log --warning 'Installed release hashes are unavailable; retaining files whose origin cannot be determined.'
+                continue ;;
+            stock)
+                [[ $action == apply ]] || log "Using new release defaults instead of unmodified file: $path"
+                continue ;;
+            custom)
+                log --warning "Preserving modified shipped file: $path. Review it against the new release; integrity warnings may remain." ;;
+            unknown)
+                log --warning "No usable original hash for $path; retaining the existing file. Review it against the new release." ;;
+            local|directory) ;;
+            *) fail "Unknown local-file classification: $kind" ;;
+        esac
+        destination="$stage/nextcloud/$path"
+        ancestor=$(dirname -- "$destination")
+        while [[ $ancestor != "$stage/nextcloud" ]]; do
+            [[ ! -L $ancestor && ( ! -e $ancestor || -d $ancestor ) ]] || fail "Local file conflicts with a release path: $path"
+            ancestor=$(dirname -- "$ancestor")
+        done
+        if [[ $kind == directory ]]; then
+            [[ ! -L $destination && ( ! -e $destination || -d $destination ) ]] || fail "Local directory conflicts with a release file: $path"
+            if [[ $action == apply ]]; then mkdir -p -- "$destination"; fi
+        else
+            [[ ! -L $destination && ! -d $destination ]] || fail "Local file conflicts with a release directory or link: $path"
+            if [[ $action == apply ]]; then
+                mkdir -p -- "$(dirname -- "$destination")"
+                cp -aT -- "$NEXTCLOUD_PATH/$path" "$destination"
+            fi
+        fi
+    done < "$workspace/local-files"
+}
+
 find_application() {
     if [[ -n $data_relative ]]; then
         find "$NEXTCLOUD_PATH" -samefile "$data_path" -prune -o "$@"
@@ -342,6 +406,60 @@ if ($mode === 'build') {
     if ($v !== $argv[3] || $OC_Channel !== 'stable') bad('Extracted release does not match the stable target');
     // This performs Nextcloud's own PHP compatibility check without loading the app.
     require $argv[2] . '/lib/versioncheck.php';
+} elseif ($mode === 'local-files') {
+    $root = $argv[2];
+    $release = $argv[3];
+    $signature = @file_get_contents($root . '/core/signature.json');
+    $hashes = $signature === false ? null : (json_decode($signature, true)['hashes'] ?? null);
+    $record = static function ($kind, $path) { echo $kind, "\0", $path, "\0"; };
+    if (!is_array($hashes)) {
+        $hashes = [];
+        $record('baseline', 'core/signature.json');
+    }
+    $paths = ['.htaccess', '.user.ini', 'config'];
+    $files = new RecursiveIteratorIterator(
+        new RecursiveDirectoryIterator($root . '/config', FilesystemIterator::SKIP_DOTS),
+        RecursiveIteratorIterator::SELF_FIRST);
+    foreach ($files as $file) $paths[] = substr($file->getPathname(), strlen($root) + 1);
+    foreach ($paths as $path) {
+        $file = $root . '/' . $path;
+        if (!file_exists($file)) continue;
+        if (is_dir($file)) { $record('directory', $path); continue; }
+        // Active configuration belongs to the installation, even if a manifest lists it.
+        if ($path === 'config/config.php' || str_ends_with($path, '.config.php')) {
+            $record('local', $path);
+            continue;
+        }
+        // Changing a regular shipped file into a link is itself a customization.
+        if (is_link($file)) {
+            $record(isset($hashes[$path]) || in_array($path, ['.htaccess', '.user.ini'], true) ? 'custom' : 'local', $path);
+            continue;
+        }
+        $rawHash = hash_file('sha512', $file);
+        if ($rawHash === false) bad('Cannot inspect local file: ' . $path);
+        $hash = $rawHash;
+        // Match Nextcloud's checksum rules: its generated .htaccess tail is excluded.
+        if ($path === '.htaccess') {
+            $content = file_get_contents($file);
+            if ($content === false) bad('Cannot inspect local file: ' . $path);
+            $parts = explode('#### DO NOT CHANGE ANYTHING ABOVE THIS LINE ####', $content);
+            if (count($parts) === 2) $hash = hash('sha512', $parts[0]);
+        }
+        $original = $hashes[$path] ?? null;
+        if (!is_string($original) || !preg_match('/^[a-f0-9]{128}$/iD', $original)) {
+            $reference = $argv[4] . '/' . $path;
+            $original = is_file($reference) ? hash_file('sha512', $reference) : null;
+        }
+        if (is_string($original) && preg_match('/^[a-f0-9]{128}$/iD', $original)) {
+            $kind = hash_equals(strtolower($original), $hash) ? 'stock' : 'custom';
+        } elseif (is_file($release . '/' . $path)) {
+            // Identical new defaults need no old baseline; otherwise retain unknown files.
+            $kind = $rawHash === hash_file('sha512', $release . '/' . $path) ? 'stock' : 'unknown';
+        } else {
+            $kind = in_array($path, ['.htaccess', '.user.ini'], true) ? 'unknown' : 'local';
+        }
+        $record($kind, $path);
+    }
 } elseif ($mode === 'custom-app') {
     libxml_use_internal_errors(true);
     $xml = simplexml_load_file($argv[2] . '/appinfo/info.xml', 'SimpleXMLElement', LIBXML_NONET);
@@ -734,6 +852,8 @@ app_inodes=$(find_application -printf '.\n' | wc -l)
 check_space "$parent" "$((unpacked_bytes + app_bytes + 104857600))" "$((entry_count + app_inodes + 1000))"
 stage=$(mktemp -d -p "$parent" .nextcloud-stage.XXXXXXXX)
 with_progress 'Copying the release into staging' cp -a -- "$release" "$stage/nextcloud"
+fetch_config_originals
+prepare_local_files inspect
 if [[ -n $data_relative ]]; then
     # Some archives contain the standard data/ skeleton. It is not live data.
     if [[ $data_relative == data && -d $stage/nextcloud/data ]]; then
@@ -981,16 +1101,12 @@ if [[ $BACKUP_DATA == yes ]]; then backup_data; fi
 set_phase backups-ready 'Recovery backups are ready; application replacement has not started.' --success
 if [[ $BACKUP_ARCHIVE == yes ]]; then package_backups; fi
 if [[ -n $BACKUP_SSH_DEST ]]; then copy_backups_offsite; fi
-# Keep all config fragments and known installation-specific application components.
-rm -rf -- "$stage/nextcloud/config"
-cp -a -- "$NEXTCLOUD_PATH/config" "$stage/nextcloud/config"
+# Reclassify after quiescing: config or overrides may have changed since preflight.
+prepare_local_files apply
 for path in "${preserved_paths[@]}"; do
     check_preserved_path "$path"
     mkdir -p -- "$(dirname -- "$stage/nextcloud/$path")"
     cp -aT -- "$NEXTCLOUD_PATH/$path" "$stage/nextcloud/$path"
-done
-for file in .htaccess .user.ini; do
-    [[ ! -f $NEXTCLOUD_PATH/$file ]] || cp -a -- "$NEXTCLOUD_PATH/$file" "$stage/nextcloud/$file"
 done
 find "$stage/nextcloud" -type l -print0 > "$workspace/staged.links"
 check_file_links "$stage/nextcloud" "$workspace/staged.links"
