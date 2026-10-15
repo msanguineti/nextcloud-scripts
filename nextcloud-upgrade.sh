@@ -3,7 +3,7 @@
 set -Eeuo pipefail
 umask 077
 # Version of this tool, independent of the Nextcloud version being installed.
-readonly SCRIPT_VERSION='1.0.0'
+readonly SCRIPT_VERSION='1.1.0'
 
 usage() {
     printf 'Nextcloud Upgrade Script %s\n\n' "$SCRIPT_VERSION"
