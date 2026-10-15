@@ -103,22 +103,48 @@ elif name == 'curl':
             dest.write_text(digest + '  ' + archive + '\n')
         else:
             import shutil; shutil.copyfile(root / suffix, dest)
-elif name == 'monit':
-    if args[0] == '-B': print('Monitoring status Monitored'); die(0)
+elif name == 'monit' or (name == 'systemctl' and args[0] in ('start', 'stop')):
+    if name == 'monit':
+        assert os.environ.get('SERVICE_MANAGER', 'monit') == 'monit', 'Wrong service backend'
+        if args[0] == '-B':
+            event('monit status ' + args[-1])
+            print('Monitoring status ' + ('Not monitored' if mode == 'unmonitored' else 'Monitored'))
+            die(0)
+    else:
+        assert os.environ.get('SERVICE_MANAGER') == 'systemd', 'Wrong service backend'
     action, svc = args
-    event('monit ' + action + ' ' + svc)
+    event(name + ' ' + action + ' ' + svc)
     assert svc in ('nginx', 'php8.4-fpm')
     if action == 'stop': fail_once('stop-' + svc)
     if action == 'start': fail_once('start-' + svc)
     state = load('services')
-    state[svc] = 'active' if action == 'start' else 'inactive'
+    expected = 'active' if action == 'start' else 'inactive'
+    state[svc] = expected
+    if name == 'monit' and os.environ.get('MONIT_DEPENDENCY') == 'yes':
+        if action == 'stop' and svc == 'nginx':
+            state['php8.4-fpm'] = 'inactive'; event('dependency stop php8.4-fpm')
+        if action == 'start' and svc == 'php8.4-fpm':
+            state['nginx'] = 'active'; event('dependency start nginx')
     if mode == 'stop-timeout' and action == 'stop': state[svc] = 'active'
     if mode == 'start-timeout' and action == 'start': state[svc] = 'inactive'
+    if os.environ.get('SERVICE_DELAY') == 'yes':
+        state[svc] = 'activating' if action == 'start' else 'deactivating'
+        save('pending-' + svc, [expected, 1])
     save('services', state)
 elif name == 'systemctl':
     assert args[0] == 'show'
-    if '--property=LoadState' in args: print('loaded')
-    else: print(load('services')[args[1]])
+    if '--property=LoadState' in args:
+        print('not-found' if mode == 'missing-unit' else 'loaded')
+    else:
+        svc = args[1]
+        pending = root / ('pending-' + svc)
+        if pending.exists():
+            target, remaining = load('pending-' + svc)
+            if remaining == 0:
+                state = load('services'); state[svc] = target; save('services', state)
+                pending.unlink()
+            else: save('pending-' + svc, [target, remaining - 1])
+        print(load('services')[svc])
 elif name == 'crontab':
     assert args[:2] == ['-u', 'www-data']
     if args[2] == '-l':
@@ -187,7 +213,8 @@ else: raise AssertionError(name)
 '''
 
 @unittest.skipUnless(REAL_PHP, 'PHP with SimpleXML required; set TEST_PHP')
-class UpgradeTests(unittest.TestCase):
+class UpgradeScenarios:
+    service_manager = 'monit'
     def setUp(self):
         self.temp = tempfile.TemporaryDirectory(prefix='nc-upgrade-test-')
         self.root = Path(self.temp.name)
@@ -198,6 +225,16 @@ class UpgradeTests(unittest.TestCase):
         names = ('sudo php curl monit systemctl crontab mariadb mariadb-dump mysql mysqldump psql pg_dump '
                  'findmnt pgrep chown stat df mv cp tar gzip').split()
         for name in names: (r / 'bin' / name).symlink_to(mock)
+        # A closed PATH prevents missing doubles from reaching real host tools.
+        tools = ('bash cat mktemp flock realpath find du awk grep sort head tail wc dirname date cmp rm '
+                 'chmod mkdir tee sync tar bzip2 unzip zipinfo sha256sum sha512sum md5sum sleep').split()
+        for name in tools:
+            if not (r / 'bin' / name).exists():
+                tool = shutil.which(name)
+                if not tool: self.skipTest('Required test utility missing: ' + name)
+                (r / 'bin' / name).symlink_to(tool)
+        if self.service_manager == 'systemd':
+            (r / 'bin/monit').unlink()
         for name in ('nextcloud/config', 'nextcloud/apps/core', 'nextcloud/apps/extra', 'nextcloud/custom_apps/test',
                      'nextcloud/themes/custom', 'storage', 'backups', 'var-tmp'):
             (r / name).mkdir(parents=True, exist_ok=True)
@@ -230,10 +267,15 @@ class UpgradeTests(unittest.TestCase):
         s = s.replace('/run/lock/nextcloud-upgrade.lock', str(r / 'upgrade.lock'))
         s = s.replace('/var/tmp', str(r / 'var-tmp'))
         self.script = r / 'script'; self.script.write_text(s)
-        self.env = dict(os.environ, PATH=str(r / 'bin') + ':' + os.environ['PATH'], TEST_ROOT=str(r), REAL_PHP=REAL_PHP,
+        self.env = dict(os.environ, PATH=str(r / 'bin'), TEST_ROOT=str(r), REAL_PHP=REAL_PHP,
+                        SERVICE_MANAGER=self.service_manager,
                         NEXTCLOUD_PATH=str(r / 'nextcloud'), BACKUP_PATH=str(r / 'backups'),
                         WAIT_BEFORE_BACKUP='0', WAIT_AFTER_SERVER_START='0')
         for name, tool in REAL_TOOLS.items(): self.env['REAL_' + name.upper()] = tool
+
+    @property
+    def service_command(self):
+        return 'monit' if self.service_manager == 'monit' else 'systemctl'
 
     def make_archive(self, unsafe=False):
         r = self.root
@@ -300,6 +342,14 @@ class UpgradeTests(unittest.TestCase):
         fields = dict(line.split('=', 1) for line in (recovery / 'manifest').read_text().splitlines())
         self.assertFalse(Path(fields['workspace']).exists())
         self.assertFalse(Path(fields['staging']).exists())
+        self.assertEqual(fields['service_manager'], self.service_manager)
+        events = (r / 'events').read_text().splitlines()
+        actions = [line for line in events if line.startswith(('monit start ', 'monit stop ', 'systemctl start ', 'systemctl stop '))]
+        expected = [f'{self.service_command} {action} {svc}' for action, svc in
+                    [('stop', 'nginx'), ('stop', 'php8.4-fpm'), ('start', 'php8.4-fpm'), ('start', 'nginx')]]
+        self.assertEqual(actions, expected)
+        if self.service_manager == 'systemd':
+            self.assertFalse(any(line.startswith('monit ') for line in events))
 
     def test_zip_success(self):
         self.assertEqual(self.run_upgrade(extra={'DOWNLOAD_FORMAT': 'zip'}).returncode, 0, self.output)
@@ -326,7 +376,7 @@ class UpgradeTests(unittest.TestCase):
             with self.subTest(mode=mode):
                 self.assertNotEqual(self.run_upgrade(mode).returncode, 0, self.output)
                 self.assert_original()
-                self.assertNotIn('monit stop', (self.root / 'events').read_text())
+                self.assertNotIn(self.service_command + ' stop', (self.root / 'events').read_text())
 
     def test_pre_migration_failures_restore_original(self):
         for mode in ('maintenance-on', 'cron-write', 'stop-nginx', 'stop-php8.4-fpm', 'background', 'backup', 'missing-footer', 'compress', 'config-backup', 'old-rename', 'new-rename', 'signal-backup'):
@@ -350,7 +400,7 @@ class UpgradeTests(unittest.TestCase):
             with self.subTest(mode=mode):
                 # Each must run independently because an unsafe attempt blocks reruns.
                 with tempfile.TemporaryDirectory():
-                    fixture = UpgradeTests('test_success_preserves_config_apps_themes_schedule_and_recovery')
+                    fixture = type(self)('test_success_preserves_config_apps_themes_schedule_and_recovery')
                     fixture.setUp()
                     try:
                         p = fixture.run_upgrade(mode)
@@ -366,7 +416,7 @@ class UpgradeTests(unittest.TestCase):
 
     def test_term_and_hup_during_migration_do_not_rollback(self):
         for mode in ('signal-migration', 'hup-migration'):
-            fixture = UpgradeTests('test_success_preserves_config_apps_themes_schedule_and_recovery'); fixture.setUp()
+            fixture = type(self)('test_success_preserves_config_apps_themes_schedule_and_recovery'); fixture.setUp()
             try:
                 self.assertNotEqual(fixture.run_upgrade(mode).returncode, 0, fixture.output)
                 fixture.assert_blocked()
@@ -440,7 +490,7 @@ class UpgradeTests(unittest.TestCase):
             s = json.loads((self.root / 'status').read_text()); s[key] = True
             (self.root / 'status').write_text(json.dumps(s))
             self.assertNotEqual(self.run_upgrade().returncode, 0, self.output)
-            self.assertNotIn('monit stop', (self.root / 'events').read_text())
+            self.assertNotIn(self.service_command + ' stop', (self.root / 'events').read_text())
             s[key] = False; (self.root / 'status').write_text(json.dumps(s))
 
     def test_cancel_and_no_update(self):
@@ -470,5 +520,58 @@ class UpgradeTests(unittest.TestCase):
         self.assertNotEqual(self.run_upgrade().returncode, 0, self.output)
         self.assertIn('already running', self.output)
         self.assert_original()
+
+    def test_invalid_service_manager_is_rejected_before_changes(self):
+        self.assertNotEqual(self.run_upgrade(extra={'SERVICE_MANAGER': 'unsupported'}).returncode, 0, self.output)
+        self.assertIn('SERVICE_MANAGER must be monit or systemd', self.output)
+        self.assertEqual((self.root / 'events').read_text(), '')
+        self.assert_original()
+
+    def test_required_service_tool_is_checked_without_fallback(self):
+        (self.root / 'bin' / self.service_command).unlink()
+        self.assertNotEqual(self.run_upgrade().returncode, 0, self.output)
+        self.assertIn('Required command missing: ' + self.service_command, self.output)
+        self.assert_original()
+
+    def test_missing_unit_is_rejected_before_changes(self):
+        self.assertNotEqual(self.run_upgrade('missing-unit').returncode, 0, self.output)
+        self.assertIn('Unknown systemd service', self.output)
+        self.assertNotIn(self.service_command + ' stop', (self.root / 'events').read_text())
+        self.assert_original()
+
+    def test_stopped_service_is_not_started_by_preflight(self):
+        (self.root / 'services').write_text(json.dumps({'nginx': 'inactive', 'php8.4-fpm': 'active'}))
+        self.assertNotEqual(self.run_upgrade().returncode, 0, self.output)
+        self.assertIn('Service must already be running', self.output)
+        self.assertEqual(json.loads((self.root / 'services').read_text()), {'nginx': 'inactive', 'php8.4-fpm': 'active'})
+        self.assertEqual((self.root / 'cron').read_text(), self.original_cron)
+        self.assertFalse((self.root / 'backups/upgrade-active').exists())
+
+    def test_service_state_polling_waits_for_completion(self):
+        self.assertEqual(self.run_upgrade(extra={'SERVICE_DELAY': 'yes', 'WAIT_AFTER_SERVER_START': '1'}).returncode, 0, self.output)
+        self.assertEqual(json.loads((self.root / 'services').read_text()), {'nginx': 'active', 'php8.4-fpm': 'active'})
+
+
+class MonitUpgradeTests(UpgradeScenarios, unittest.TestCase):
+    def test_unmonitored_service_is_rejected_in_monit_mode(self):
+        self.assertNotEqual(self.run_upgrade('unmonitored').returncode, 0, self.output)
+        self.assertIn('Service must already be monitored', self.output)
+        self.assert_original()
+
+    def test_monit_dependency_cascade_keeps_migration_isolated(self):
+        self.assertEqual(self.run_upgrade(extra={'MONIT_DEPENDENCY': 'yes'}).returncode, 0, self.output)
+        events = (self.root / 'events').read_text().splitlines()
+        self.assertLess(events.index('dependency stop php8.4-fpm'), events.index('dump'))
+        self.assertLess(events.index('occ upgrade'), events.index('dependency start nginx'))
+        self.assertEqual(json.loads((self.root / 'services').read_text()), {'nginx': 'active', 'php8.4-fpm': 'active'})
+        self.assertEqual((self.root / 'cron').read_text(), self.original_cron)
+
+    def test_default_manager_remains_monit(self):
+        self.env.pop('SERVICE_MANAGER')
+        self.assertEqual(self.run_upgrade().returncode, 0, self.output)
+        self.assertIn('monit stop nginx', (self.root / 'events').read_text())
+
+class SystemdUpgradeTests(UpgradeScenarios, unittest.TestCase):
+    service_manager = 'systemd'
 
 if __name__ == '__main__': unittest.main(verbosity=2)

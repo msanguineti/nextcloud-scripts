@@ -15,17 +15,20 @@ The script supports a conventional Linux installation with:
 
 - Bash, GNU command-line utilities and PHP CLI with SimpleXML, available as `php`.
 - Nextcloud commands and cron jobs running as `www-data`.
-- Nginx and PHP-FPM managed by Monit, with service names matching their systemd
-  unit names. Both services must already be running and monitored.
+- A web server and PHP-FPM with systemd service units. Both services must already
+  be running. Nginx is the default web server; service names are configurable.
+- Monit, when using the default service manager. Its service names must match
+  the systemd unit names, and both services must already be monitored.
 - MariaDB/MySQL or PostgreSQL. Database settings are read from Nextcloud.
 - A user-data directory outside the Nextcloud installation directory.
 - Enough disk space and inodes for the downloaded release, extracted files,
   staged installation and recovery backups.
 
-The required utilities include `sudo`, `curl`, `monit`, `systemctl`, `crontab`,
-`pgrep`, `flock`, `findmnt`, `gzip`, and checksum tools. The default archive format
-uses `tar` and `bzip2`; ZIP requires `unzip` and `zipinfo`. For MariaDB/MySQL,
-install `mariadb` and `mariadb-dump`, or their `mysql` and `mysqldump` equivalents.
+The required utilities include `sudo`, `curl`, `systemctl`, `crontab`, `pgrep`,
+`flock`, `findmnt`, `gzip`, and checksum tools. Monit is only required when
+`SERVICE_MANAGER=monit`; select `systemd` to manage services directly. The default
+archive format uses `tar` and `bzip2`; ZIP requires `unzip` and `zipinfo`.
+For MariaDB/MySQL, install `mariadb` and `mariadb-dump`, or their `mysql` and `mysqldump` equivalents.
 For PostgreSQL, install `psql` and `pg_dump`. The script checks required commands
 before upgrading.
 
@@ -80,8 +83,9 @@ continue; any other answer cancels. Cancellation at this prompt leaves the
 installation running, although downloads and preparation have already occurred.
 
 After confirmation, the script enables maintenance mode, suspends this
-installation's cron entries, stops Nginx and PHP-FPM through Monit, waits for
-existing Nextcloud CLI jobs to finish, and creates the recovery backups. It then
+installation's cron entries, stops the web server and PHP-FPM through the selected
+service manager, waits for existing Nextcloud CLI jobs to finish, and creates
+the recovery backups. It then
 replaces the application, runs `occ upgrade`, verifies the installed version and
 database migration state, and restores services and the original cron schedule.
 
@@ -115,14 +119,34 @@ sudo env NEXTCLOUD_PATH=/srv/nextcloud \
 | --- | --- | --- |
 | `NEXTCLOUD_PATH` | `/var/www/nextcloud` | Nextcloud installation directory. |
 | `BACKUP_PATH` | `/var/backups/nextcloud` | Directory for upgrade recovery backups. |
-| `WEB_SERVICE` | `nginx` | Web-server service name in Monit and systemd. |
-| `PHP_SERVICE` | `php8.4-fpm` | PHP-FPM service name in Monit and systemd. |
+| `SERVICE_MANAGER` | `monit` | Service control backend: `monit` or `systemd`. |
+| `WEB_SERVICE` | `nginx` | Web-server systemd unit name; also the Monit name when selected. |
+| `PHP_SERVICE` | `php8.4-fpm` | PHP-FPM systemd unit name; also the Monit name when selected. |
 | `WAIT_BEFORE_BACKUP` | `60` | Maximum seconds to wait for existing Nextcloud cron/occ processes after services stop. |
-| `WAIT_AFTER_SERVER_START` | `20` | Maximum seconds to wait for each service to reach its started or stopped state. |
+| `WAIT_AFTER_SERVER_START` | `20` | Maximum seconds to poll each service state after its start/stop command returns. |
 | `DOWNLOAD_FORMAT` | `tar.bz2` | Release archive format: `tar.bz2` or `zip`. |
 | `CHECKSUM_TYPE` | `sha256` | Checksum: `sha256`, `sha512`, or legacy `md5`. Prefer SHA256 or SHA512. |
 
-For a different PHP-FPM service and a longer service timeout:
+To use systemd directly on a server without Monit supervision:
+
+```bash
+sudo env SERVICE_MANAGER=systemd nextcloud-upgrade
+```
+
+Keep the default `monit` setting when Monit supervises these services. Stopping a
+service directly with systemd leaves Monit free to start it again. In systemd
+mode, ensure no other supervisor or activation mechanism will restart the selected
+services during the upgrade. The script does not switch backends automatically
+or change supervisor configuration.
+
+Both backends verify actual service state through systemd. The selected manager
+is also used during failure recovery and recorded with the recovery artifacts.
+Monit applies its configured dependencies: for example, if PHP-FPM depends on
+Nginx, stopping Nginx through Monit also stops PHP-FPM. Startup may likewise
+start a prerequisite service automatically; maintenance remains enabled until
+the upgrade has been verified.
+
+For a different PHP-FPM service and a longer service-state polling timeout:
 
 ```bash
 sudo env PHP_SERVICE=php8.3-fpm WAIT_AFTER_SERVER_START=60 nextcloud-upgrade
@@ -140,7 +164,6 @@ sudo env DOWNLOAD_FORMAT=zip CHECKSUM_TYPE=sha512 nextcloud-upgrade
 
 Checksum verification checks the downloaded archive against a checksum fetched
 from the same HTTPS release server; it is not an independent signature check.
-Monit controls service starts and stops; systemd is used to verify service state.
 Cron entries are restored exactly, including their schedules and disabled entries.
 
 ## Custom apps, themes and configuration
@@ -186,8 +209,8 @@ For an unresolved attempt, read `BACKUP_PATH/upgrade-active` and the referenced
 directory's `manifest`, `phase`, `failure` and `upgrade.log` where available. Read
 these as text; do not execute or source them. The script refuses another upgrade
 until that attempt has been resolved. Preserve the marker and backups while
-investigating, stop access through Monit, and check for any still-running
-migration process before recovery. Reconcile external crontab edits rather than
+investigating, block access using the recorded service manager, and check for any
+still-running migration process before recovery. Reconcile external crontab edits rather than
 blindly replacing them.
 
 Existing maintenance mode, a pending migration, a concurrent upgrade or a legacy
@@ -208,7 +231,9 @@ rollback is only automatic before migration starts.
 
 `occ` runs Nextcloud commands as `www-data`; `php_info` parses structured metadata
 and validates releases/status. `stop_services`, `start_services` and
-`wait_service` handle service control; `restore_cron` checks for concurrent edits.
+`wait_service` handle service control through `service_control`; `check_services`
+validates the selected backend's prerequisites. `restore_cron` checks for
+concurrent edits.
 Keep ownership/deletion operations away from the user-data directory.
 
 Run local checks from the repository:

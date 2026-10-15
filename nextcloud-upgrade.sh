@@ -5,6 +5,7 @@ umask 077
 
 NEXTCLOUD_PATH="${NEXTCLOUD_PATH:-/var/www/nextcloud}"
 BACKUP_PATH="${BACKUP_PATH:-/var/backups/nextcloud}"
+SERVICE_MANAGER="${SERVICE_MANAGER:-monit}"
 WEB_SERVICE="${WEB_SERVICE:-nginx}"
 PHP_SERVICE="${PHP_SERVICE:-php8.4-fpm}"
 WAIT_BEFORE_BACKUP="${WAIT_BEFORE_BACKUP:-60}"
@@ -86,6 +87,28 @@ set_phase() {
     log "$2"
 }
 
+# Keep backend selection out of the upgrade and recovery lifecycle.
+service_control() {
+    local action=$1 service=$2
+    case $SERVICE_MANAGER in
+        monit) monit "$action" "$service" ;;
+        systemd) systemctl "$action" "$service" ;;
+        *) return 1 ;;
+    esac
+}
+
+check_services() {
+    local service
+    for service in "$WEB_SERVICE" "$PHP_SERVICE"; do
+        [[ $service =~ ^[A-Za-z0-9_.@-]+$ ]] || fail 'Invalid service name.'
+        [[ $(systemctl show "$service" --property=LoadState --value) == loaded ]] || fail "Unknown systemd service: $service"
+        [[ $(systemctl show "$service" --property=ActiveState --value) == active ]] || fail "Service must already be running: $service"
+        if [[ $SERVICE_MANAGER == monit ]]; then
+            monit -B status "$service" | grep -Eiq 'monitoring status[[:space:]]+Monitored' || fail "Service must already be monitored: $service"
+        fi
+    done
+}
+
 wait_service() {
     local service=$1 expected=$2 state i
     for ((i=0; i<=WAIT_AFTER_SERVER_START; i++)); do
@@ -99,14 +122,14 @@ wait_service() {
 stop_services() {
     local rc=0
     # Try both even when one fails: stopped PHP still blocks application access.
-    monit stop "$WEB_SERVICE" && wait_service "$WEB_SERVICE" inactive || rc=1
-    monit stop "$PHP_SERVICE" && wait_service "$PHP_SERVICE" inactive || rc=1
+    service_control stop "$WEB_SERVICE" && wait_service "$WEB_SERVICE" inactive || rc=1
+    service_control stop "$PHP_SERVICE" && wait_service "$PHP_SERVICE" inactive || rc=1
     return "$rc"
 }
 start_services() {
-    monit start "$PHP_SERVICE" || return 1
+    service_control start "$PHP_SERVICE" || return 1
     wait_service "$PHP_SERVICE" active || return 1
-    monit start "$WEB_SERVICE" || return 1
+    service_control start "$WEB_SERVICE" || return 1
     wait_service "$WEB_SERVICE" active || return 1
 }
 restore_cron() {
@@ -205,7 +228,12 @@ trap 'exit 129' HUP
 
 [[ $EUID == 0 ]] || fail 'Run as root.'
 [[ $# -le 1 ]] || fail 'Usage: nextcloud-upgrade.sh [stable-version]'
-for cmd in cat sudo php curl mktemp flock realpath stat find findmnt df du awk grep sort head tail wc dirname date cmp cp mv rm chmod chown mkdir gzip tee sync crontab monit systemctl pgrep; do need "$cmd"; done
+case $SERVICE_MANAGER in
+    monit) need monit ;;
+    systemd) ;;
+    *) fail 'SERVICE_MANAGER must be monit or systemd.' ;;
+esac
+for cmd in cat sudo php curl mktemp flock realpath stat find findmnt df du awk grep sort head tail wc dirname date cmp cp mv rm chmod chown mkdir gzip tee sync crontab systemctl pgrep; do need "$cmd"; done
 php -r 'exit(extension_loaded("SimpleXML") ? 0 : 1);' || fail 'PHP SimpleXML is required for update responses.'
 for value in "$WAIT_BEFORE_BACKUP" "$WAIT_AFTER_SERVER_START"; do
     [[ $value =~ ^[0-9]+$ && ${#value} -le 5 ]] || fail 'Wait values must be nonnegative integers (at most five digits).'
@@ -241,12 +269,8 @@ data_path=$(realpath -e -- "$(config datadirectory)")
 [[ $BACKUP_PATH != "$data_path" && $BACKUP_PATH != "$data_path/"* ]] || fail 'Recovery backups must be outside the user-data directory.'
 current_version=$(occ status --output=json | php_info status off)
 [[ $current_version =~ ^[0-9]+\.[0-9]+\.[0-9]+(\.[0-9]+)?$ ]] || fail 'Invalid installed version.'
-for service in "$WEB_SERVICE" "$PHP_SERVICE"; do
-    [[ $service =~ ^[A-Za-z0-9_.@-]+$ ]] || fail 'Invalid service name.'
-    [[ $(systemctl show "$service" --property=LoadState --value) == loaded ]] || fail "Unknown systemd service: $service"
-    [[ $(systemctl show "$service" --property=ActiveState --value) == active ]] || fail "Service must already be running: $service"
-    monit -B status "$service" | grep -Eiq 'monitoring status[[:space:]]+Monitored' || fail "Service must already be monitored: $service"
-done
+check_services
+log "Service manager: $SERVICE_MANAGER"
 
 workspace=$(mktemp -d -p /var/tmp nextcloud-upgrade.XXXXXXXX)
 log "Private workspace: $workspace"
@@ -380,9 +404,9 @@ read -r -p 'Proceed with the upgrade? [y/N]: ' answer
 recovery=$(mktemp -d -p "$BACKUP_PATH" "upgrade-$(date -u +%Y%m%dT%H%M%SZ).XXXXXXXX")
 old_path="${NEXTCLOUD_PATH}.old.${recovery##*/}"
 cp -- "$workspace/cron.original" "$workspace/cron.disabled" "$recovery/"
-printf 'installation=%s\nprevious_version=%s\ntarget_version=%s\nold_application=%s\nstaging=%s\nworkspace=%s\ndatabase_type=%s\ndatabase_name=%s\nweb_service=%s\nphp_service=%s\n' \
-    "$NEXTCLOUD_PATH" "$current_version" "$download_version" "$old_path" "$stage" "$workspace" "$db_type" "$db_name" "$WEB_SERVICE" "$PHP_SERVICE" > "$recovery/manifest"
-set_phase quiescing 'Enabling maintenance, disabling Nextcloud cron, and stopping web/PHP services.'
+printf 'installation=%s\nprevious_version=%s\ntarget_version=%s\nold_application=%s\nstaging=%s\nworkspace=%s\ndatabase_type=%s\ndatabase_name=%s\nservice_manager=%s\nweb_service=%s\nphp_service=%s\n' \
+    "$NEXTCLOUD_PATH" "$current_version" "$download_version" "$old_path" "$stage" "$workspace" "$db_type" "$db_name" "$SERVICE_MANAGER" "$WEB_SERVICE" "$PHP_SERVICE" > "$recovery/manifest"
+set_phase quiescing "Enabling maintenance, disabling Nextcloud cron, and stopping web/PHP services through $SERVICE_MANAGER."
 printf '%s\n' "$recovery" > "$BACKUP_PATH/upgrade-active"
 sync -f "$BACKUP_PATH"
 production_changed=yes
