@@ -23,6 +23,18 @@ import zipfile
 SCRIPT = Path(__file__).resolve().parents[1] / 'nextcloud-upgrade.sh'
 REAL_PHP = shutil.which(os.environ.get('TEST_PHP', 'php'))
 REAL_TOOLS = {name: shutil.which(name) for name in ('stat', 'mv', 'cp', 'tar', 'gzip', 'df', 'rsync', 'sleep')}
+NEW_USER_INI = '''; SPDX-FileCopyrightText: 2016-2024 Nextcloud GmbH and Nextcloud contributors
+; SPDX-FileCopyrightText: 2014-2016 ownCloud, Inc.
+; SPDX-License-Identifier: AGPL-3.0-only
+;
+; NOTE: PHP caches this file for 300 seconds by default
+;
+default_charset='UTF-8'
+output_buffering=0
+'''
+OLD_USER_INI = NEW_USER_INI.replace("default_charset=", "always_populate_raw_post_data=-1\ndefault_charset=")
+OLD_HTACCESS = '# Old shipped Apache rules\n'
+NEW_HTACCESS = '# New shipped Apache rules\n'
 
 MOCK = r'''#!/usr/bin/env python3
 import json, os, pathlib, signal, sys, time
@@ -78,6 +90,9 @@ if name == 'sudo':
     elif a[0] == 'maintenance:mode':
         if a[1] == '--on': fail_once('maintenance-on')
         if a[1] == '--off': fail_once('maintenance-off')
+        if a[1] == '--on' and mode == 'local-file-changed' and not (root / 'local-file-changed').exists():
+            (root / 'nextcloud/.user.ini').write_text('memory_limit=768M\n')
+            (root / 'local-file-changed').touch()
         s['maintenance'] = a[1] == '--on'; save('status', s)
     elif a[0] == 'upgrade':
         assert all(state == 'inactive' for state in load('services').values())
@@ -111,6 +126,11 @@ elif name == 'curl':
     else:
         dest = pathlib.Path(args[args.index('-o') + 1])
         assert str(dest).startswith(str(root / 'var-tmp/nextcloud-upgrade.')), dest
+        if url.startswith('https://raw.githubusercontent.com/nextcloud/server/v34.0.0/config/'):
+            if mode == 'config-baseline': dest.write_text('partial download'); die(22)
+            original = root / 'original-config' / url.split('/v34.0.0/', 1)[1]
+            if not original.is_file(): die(22)
+            dest.write_bytes(original.read_bytes()); die(0)
         suffix = url.rsplit('/', 1)[1]
         if suffix.endswith(('.sha256', '.sha512', '.md5')):
             archive = suffix.rsplit('.', 1)[0]
@@ -346,7 +366,7 @@ class UpgradeFixture:
                 (r / 'bin' / name).symlink_to(tool)
         if self.service_manager == 'systemd':
             (r / 'bin/monit').unlink()
-        for name in ('nextcloud/config', 'nextcloud/apps/core', 'nextcloud/apps/extra', 'nextcloud/custom_apps/test',
+        for name in ('nextcloud/config', 'nextcloud/core', 'nextcloud/apps/core', 'nextcloud/apps/extra', 'nextcloud/custom_apps/test',
                      'nextcloud/themes/custom', 'storage', 'backups', 'var-tmp'):
             (r / name).mkdir(parents=True, exist_ok=True)
         (r / 'backups').chmod(0o700)
@@ -358,6 +378,7 @@ class UpgradeFixture:
         (r / 'nextcloud/themes/custom/style.css').write_text('custom theme')
         (r / 'nextcloud/.user.ini').write_text('custom ini')
         (r / 'nextcloud/.htaccess').write_text('custom Apache settings')
+        self.record_stock_files({'.user.ini': OLD_USER_INI, '.htaccess': OLD_HTACCESS})
         (r / 'storage/sentinel').write_text('Never modify or duplicate EFS data')
         (r / 'nextcloud/version.php').write_text("<?php $OC_Build='2026-10-14';")
         (r / 'status').write_text(json.dumps(dict(installed=True, maintenance=False, needsDbUpgrade=False, version='34.0.0.0')))
@@ -370,6 +391,8 @@ class UpgradeFixture:
         release = r / 'release/nextcloud'
         for name in ('config', 'apps/core', 'themes', 'lib'): (release / name).mkdir(parents=True, exist_ok=True)
         for name in ('occ', 'index.php', 'status.php'): (release / name).write_text('new-code')
+        (release / '.user.ini').write_text(NEW_USER_INI)
+        (release / '.htaccess').write_text(NEW_HTACCESS)
         (release / 'version.php').write_text("<?php $OC_Version=[34,0,1,0]; $OC_Channel='stable';")
         (release / 'lib/versioncheck.php').write_text('<?php if (PHP_VERSION_ID < 80400) exit(1);')
         self.make_archive()
@@ -408,6 +431,12 @@ class UpgradeFixture:
                     archive.writestr(info, os.readlink(p))
                 else:
                     archive.write(p, name + ('/' if p.is_dir() else ''))
+
+    def record_stock_files(self, files):
+        signature = self.root / 'nextcloud/core/signature.json'
+        hashes = json.loads(signature.read_text())['hashes'] if signature.exists() else {}
+        hashes.update({name: hashlib.sha512(content.encode()).hexdigest() for name, content in files.items()})
+        signature.write_text(json.dumps({'hashes': hashes}))
 
     def run_upgrade(self, mode='', args=(), answer='y', extra=None):
         env = dict(self.env, FAIL_AT=mode, **(extra or {}))
@@ -454,6 +483,125 @@ class UpgradeFixture:
 
 class UpgradeScenarios(UpgradeFixture):
     # Manager-independent behavior is exercised once with systemd.
+    def stock_file_fixture(self):
+        f = type(self)('test_success_preserves_config_apps_themes_schedule_and_recovery')
+        f.setUp()
+        self.addCleanup(f.doCleanups)
+        old = {'.user.ini': OLD_USER_INI, '.htaccess': OLD_HTACCESS,
+               'config/config.sample.php': 'old shipped example',
+               'config/.htaccess': 'old config protection'}
+        new = {'.user.ini': NEW_USER_INI, '.htaccess': NEW_HTACCESS,
+               'config/config.sample.php': 'new shipped example',
+               'config/.htaccess': 'new config protection'}
+        for directory, files in ((f.root / 'nextcloud', old), (f.root / 'release/nextcloud', new)):
+            for name, content in files.items():
+                (directory / name).write_text(content)
+        f.record_stock_files({name: content for name, content in old.items() if not name.startswith('config/')})
+        for name, content in old.items():
+            if name.startswith('config/'):
+                reference = f.root / 'original-config' / name
+                reference.parent.mkdir(parents=True, exist_ok=True)
+                reference.write_text(content)
+        f.make_archive()
+        return f, old, new
+
+    def test_stock_files_use_new_defaults_and_backups_keep_originals(self):
+        for archive_format in ('tar.bz2', 'zip'):
+            with self.subTest(archive_format=archive_format):
+                f, old, new = self.stock_file_fixture()
+                nested = f.root / 'nextcloud/config/local'; nested.mkdir()
+                (nested / '.hidden').write_text('local configuration')
+                (nested / 'link').symlink_to('.hidden')
+                self.assertEqual(f.run_upgrade(extra={'DOWNLOAD_FORMAT': archive_format}).returncode, 0, f.output)
+                for name, content in new.items():
+                    self.assertEqual((f.root / 'nextcloud' / name).read_text(), content)
+                self.assertEqual(hashlib.sha512((f.root / 'nextcloud/.user.ini').read_bytes()).hexdigest(),
+                                 '5cf34c20dbe0ddb9940eaeee08c1d9ac3a5f6cde8deac9dfb6ba5a1a2e40fda496f15f46e9d23250257bc6baa9a34f65113788afd335655beb4edb593ccd39d0')
+                self.assertEqual((f.root / 'nextcloud/config/config.php').read_text(), 'configuration')
+                self.assertEqual((f.root / 'nextcloud/config/extra.config.php').read_text(), 'extra config')
+                self.assertEqual((nested / '.hidden').read_text(), 'local configuration')
+                self.assertEqual(os.readlink(nested / 'link'), '.hidden')
+                recovery = next((f.root / 'backups').glob('upgrade-*/manifest')).parent
+                for name, content in old.items():
+                    self.assertEqual((recovery / name).read_text(), content)
+
+    def test_modified_shipped_files_are_retained_with_a_warning(self):
+        f, _, _ = self.stock_file_fixture()
+        for name in ('.user.ini', '.htaccess', 'config/config.sample.php'):
+            (f.root / 'nextcloud' / name).write_text('local customization\n')
+        self.assertEqual(f.run_upgrade().returncode, 0, f.output)
+        for name in ('.user.ini', '.htaccess', 'config/config.sample.php'):
+            self.assertEqual((f.root / 'nextcloud' / name).read_text(), 'local customization\n')
+            self.assertIn('Preserving modified shipped file: ' + name, f.output)
+
+    def test_generated_htaccess_section_does_not_preserve_old_shipped_rules(self):
+        f, _, _ = self.stock_file_fixture()
+        (f.root / 'nextcloud/.htaccess').write_text(
+            OLD_HTACCESS + '#### DO NOT CHANGE ANYTHING ABOVE THIS LINE ####\nErrorDocument 404 /index.php/error/404\n')
+        self.assertEqual(f.run_upgrade().returncode, 0, f.output)
+        self.assertEqual((f.root / 'nextcloud/.htaccess').read_text(), NEW_HTACCESS)
+        self.assertNotIn('Preserving modified shipped file: .htaccess', f.output)
+
+    def test_missing_or_invalid_baselines_keep_unknown_files_with_a_warning(self):
+        for baseline in (None, '{bad json', '{"hashes": []}', '{"hashes": {".user.ini": "bad hash"}}'):
+            with self.subTest(baseline=baseline):
+                f, _, _ = self.stock_file_fixture()
+                signature = f.root / 'nextcloud/core/signature.json'
+                if baseline is None:
+                    signature.unlink()
+                else:
+                    signature.write_text(baseline)
+                self.assertEqual(f.run_upgrade('config-baseline').returncode, 0, f.output)
+                self.assertEqual((f.root / 'nextcloud/.user.ini').read_text(), OLD_USER_INI)
+                self.assertEqual((f.root / 'nextcloud/config/config.sample.php').read_text(), 'old shipped example')
+                self.assertIn('No usable original hash for .user.ini', f.output)
+                self.assertIn('Cannot fetch the original config/config.sample.php', f.output)
+
+        f, _, _ = self.stock_file_fixture()
+        (f.root / 'nextcloud/core/signature.json').unlink()
+        (f.root / 'nextcloud/.user.ini').write_text(NEW_USER_INI)
+        self.assertEqual(f.run_upgrade().returncode, 0, f.output)
+        self.assertEqual((f.root / 'nextcloud/.user.ini').read_text(), NEW_USER_INI)
+        self.assertNotIn('No usable original hash for .user.ini', f.output)
+
+    def test_removed_unmodified_override_is_not_carried_into_the_new_release(self):
+        f, _, _ = self.stock_file_fixture()
+        (f.root / 'release/nextcloud/.user.ini').unlink()
+        f.make_archive()
+        self.assertEqual(f.run_upgrade().returncode, 0, f.output)
+        self.assertFalse((f.root / 'nextcloud/.user.ini').exists())
+
+    def test_local_configuration_conflicts_are_rejected_before_maintenance(self):
+        for conflict in ('directory', 'link'):
+            with self.subTest(conflict=conflict):
+                f, _, _ = self.stock_file_fixture()
+                if conflict == 'directory':
+                    (f.root / 'nextcloud/config/local').mkdir()
+                    (f.root / 'release/nextcloud/config/local').write_text('new shipped file')
+                else:
+                    (f.root / 'release/nextcloud/config/extra.config.php').symlink_to('config.sample.php')
+                f.make_archive()
+                self.assertNotEqual(f.run_upgrade().returncode, 0, f.output)
+                self.assertIn('conflicts with a release', f.output)
+                self.assertNotIn('occ maintenance:mode', (f.root / 'events').read_text())
+                f.assert_original()
+
+    def test_configuration_links_are_retained_even_when_content_is_stock(self):
+        f, _, _ = self.stock_file_fixture()
+        (f.root / 'nextcloud/config/php-overrides.ini').write_text(OLD_USER_INI)
+        (f.root / 'nextcloud/.user.ini').unlink()
+        (f.root / 'nextcloud/.user.ini').symlink_to('config/php-overrides.ini')
+        self.assertEqual(f.run_upgrade().returncode, 0, f.output)
+        self.assertEqual(os.readlink(f.root / 'nextcloud/.user.ini'), 'config/php-overrides.ini')
+        self.assertEqual((f.root / 'nextcloud/.user.ini').read_text(), OLD_USER_INI)
+        self.assertIn('Preserving modified shipped file: .user.ini', f.output)
+
+    def test_local_files_are_rechecked_after_maintenance_starts(self):
+        f, _, _ = self.stock_file_fixture()
+        self.assertEqual(f.run_upgrade('local-file-changed').returncode, 0, f.output)
+        self.assertEqual((f.root / 'nextcloud/.user.ini').read_text(), 'memory_limit=768M\n')
+        self.assertIn('Preserving modified shipped file: .user.ini', f.output)
+
     def test_zip_success(self):
         self.assertEqual(self.run_upgrade(extra={'DOWNLOAD_FORMAT': 'zip'}).returncode, 0, self.output)
 
